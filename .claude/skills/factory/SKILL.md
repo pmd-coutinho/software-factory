@@ -41,14 +41,14 @@ Jira epic / ticket keys (Atlassian MCP)  OR  GitHub issues labeled `factory` (`g
         │
         ▼
 intake (fable)          → ACCEPT (scope possibly changed) | NEEDS-INFO | REJECT, commented on ticket/issue
-route (script)          → assigns all 4 mandatory reviewers on opus (effort: high)
+route (script)          → assigns reviewers from config.json (code + security always; ux + ui on `ui` surface)
 worktree                → factory/<job-id> from origin/<base>
 spec-writer (opus high) → spec.md with small, ordered chunks (## Implementation Plan)
 builder (haiku)         → runs each chunk sequentially on the same worktree; final chunk pushes + opens draft PR
-gate (script)           → checks.sh; FAIL → Haiku builder fixes gate log, no reviewers spawned
-reviewers (4× opus high)→ code, security, ux, ui in parallel (ALL 4 MANDATORY); WAIT FOR ALL
-                          any CHANGES → Haiku review-fixer subagents address findings point by point → gate → review
-approver (opus high)    → writes human-review summary (decision.md) → posts PR comment → gh pr ready (NO auto-merge)
+gate (script)           → clean-tree + protected-paths + timed checks.sh; FAIL → Haiku builder fixes gate log
+reviewers (opus high)   → routed reviewers in parallel; WAIT FOR ALL
+                          any CHANGES → deduplicate overlapping findings → Haiku review-fixer subagents → gate → review
+approver (opus high)    → writes human-review summary (decision.md) → PR comment (+ conflict warning) → gh pr ready
 ```
 
 A job has at most `max_rounds` build rounds (`config.json`); a round is one
@@ -122,7 +122,12 @@ review files to dispatch Haiku subagents.
        below the header.
     2. A PR is marked ready for human review (`needs-human`): post the PR URL
        and a one-line note that the human-review summary is on the PR.
-    3. A job is rejected via `job reject`: post the rejection reason.
+    3. A job is rejected or cancelled via `job reject` / `job cancel`: post the
+       rejection reason.
+    After posting each Jira comment, run `factory/bin/job jira-commented <id>`
+    to clear `pending_jira_comment`. On resume, if any job has
+    `pending_jira_comment` set (shown in `job status` / `job queue`), post the
+    missing Jira comment and clear it before advancing.
 
 ## Spawning agents
 
@@ -166,13 +171,15 @@ short line per transition, e.g. `001-proj-123-export PROJ-123: gate PASS → rev
 **intake.** Spawn `intake` with `<header>`. When it returns, read its decision:
 
 - `ACCEPT`: run `factory/bin/route <id>`, then `factory/bin/job advance <id> spec`
-  (creates the worktree), and post `intake.md` (below header) as a `[factory]`
-  comment on the Jira ticket. Go to **spec**.
-- `NEEDS-INFO`: `factory/bin/job advance <id> needs-info` and post `intake.md`
-  (below header) as a `[factory]` comment on Jira. The job parks until the
-  reporter replies.
-- `REJECT`: `factory/bin/job advance <id> rejected` and post `intake.md`
-  (below header) as a `[factory]` comment on Jira.
+  (creates the worktree). In `jira` mode, post `intake.md` (below header) as a
+  `[factory]` comment on the Jira ticket and run `factory/bin/job jira-commented <id>`.
+  Go to **spec**.
+- `NEEDS-INFO`: `factory/bin/job advance <id> needs-info`. In `jira` mode, post
+  `intake.md` (below header) as a `[factory]` comment on Jira and run
+  `factory/bin/job jira-commented <id>`. The job parks until the reporter replies.
+- `REJECT`: `factory/bin/job advance <id> rejected`. In `jira` mode, post
+  `intake.md` (below header) as a `[factory]` comment on Jira and run
+  `factory/bin/job jira-commented <id>`.
 
 **spec.** Spawn `spec-writer` with `<header>`. When it returns,
 `factory/bin/job advance <id> build` and go to **build (chunks)**.
@@ -182,56 +189,70 @@ headings from `<job folder>/spec.md` (`grep '^### Chunk '`). Run them
 **sequentially, one fresh Haiku `builder` subagent per chunk**, on the same
 worktree:
 
+- Before spawning chunk `k`, record progress for the dashboard:
+  `factory/bin/job progress <id> "chunk <k>/<M>: <title>"`
 - Spawn `builder` with:
   `<header> Build round 1. Port: <port>. Chunk <k> of <M>: <title>. Implement ONLY Chunk <k> from spec.md.`
-  (If `k == M`, add: `This is the final chunk: run factory/checks.sh, verify acceptance criteria, push, open the draft PR, and set STATUS: READY in build.md.`)
+  (If `k == M`, add: `This is the final chunk: run factory/checks.sh, verify acceptance criteria, push, open the draft PR, and set STATUS: READY with ROUND and COMMIT in build.md.`)
 - Wait for chunk `k` to finish before starting chunk `k + 1`.
-- If any chunk writes `STATUS: BLOCKED`, run `factory/bin/job advance <id> needs-human`.
-- When chunk `M` finishes with `STATUS: READY`, run `factory/bin/job advance <id> gate`
-  and go to **gate**. If `advance` refuses (uncommitted changes, not pushed, no
-  PR), spawn one Haiku `builder` fix with the refusal; if it refuses again,
-  stop this job and tell the user.
+- If any chunk writes `STATUS: BLOCKED`, run `factory/bin/job cleanup-ports <id>`
+  and `factory/bin/job advance <id> needs-human`.
+- When chunk `M` finishes with `STATUS: READY`, run
+  `factory/bin/job cleanup-ports <id>`, then `factory/bin/job advance <id> gate`
+  and go to **gate**. If `advance` refuses (uncommitted changes, stale
+  `build.md`, not pushed, no PR), spawn one Haiku `builder` fix with the
+  refusal; if it refuses again, stop this job and tell the user.
 
-**build (gate-fix).** When the gate fails and another round is allowed, spawn a
-fresh Haiku `builder` subagent with:
-`<header> Build round <N>. Port: <port>. Gate-fix mode: read round-<N-1>/checks.md and checks.log, fix the failure, run factory/checks.sh, commit, push, and set STATUS: READY in build.md.`
-When it finishes, advance `build → gate` (or `needs-human` if `STATUS: BLOCKED`).
+**build (gate-fix).** When the gate fails and another round is allowed, run
+`factory/bin/job progress <id> "gate-fix (round <N>)"` and spawn a fresh Haiku
+`builder` subagent with:
+`<header> Build round <N>. Port: <port>. Gate-fix mode: read round-<N-1>/checks.md and checks.log, fix the failure, run factory/checks.sh, commit, push, and set STATUS: READY with ROUND and COMMIT in build.md.`
+When it finishes, run `factory/bin/job cleanup-ports <id>` and advance
+`build → gate` (or `needs-human` if `STATUS: BLOCKED`).
 
 **build (review-fixes — point by point).** When reviews in `round-<N-1>/`
 request changes and another round is allowed:
 
 1. Read the `## Findings` section from every `VERDICT: CHANGES` file in
    `round-<N-1>/review-*.md` and collect all numbered findings into an ordered
-   list of `T` items (each tagged with its reviewer name and finding text).
+   list. **Deduplicate and group** any findings from different reviewers that
+   target the same file/function into one combined finding so sequential fixes
+   do not overwrite each other. Call the resulting list length `T`.
 2. Run them **sequentially, one fresh Haiku `review-fixer` subagent per
    finding**, on the same worktree:
-   `<header> Build round <N>. Review round <N-1> fix <i> of <T>. Reviewer: <r>. Finding: <finding text>.`
-   (For `i == T`, add: `This is the final finding: run factory/checks.sh, push, and set STATUS: READY in build.md.`)
+   - First record progress: `factory/bin/job progress <id> "fix <i>/<T> (<reviewer>)"`
+   - Spawn `review-fixer` with:
+     `<header> Build round <N>. Review round <N-1> fix <i> of <T>. Reviewer: <r>. Finding: <finding text>.`
+     (For `i == T`, add: `This is the final finding: run factory/checks.sh, push, and set STATUS: READY with ROUND and COMMIT in build.md.`)
 3. Wait for fix `i` to complete before starting fix `i + 1`. If any writes
    `STATUS: BLOCKED`, run `factory/bin/job advance <id> needs-human`.
 4. After fix `T` completes with `STATUS: READY`, run
    `factory/bin/job advance <id> gate` and go to **gate**.
 
-**build (feedback).** When the user gives feedback via `job feedback`, spawn a
-fresh Haiku `builder` subagent with:
-`<header> Build round <N>. Port: <port>. Feedback mode: read feedback-<k>.md, address it, run factory/checks.sh, commit, push, and set STATUS: READY in build.md.`
-Then advance `build → gate`.
+**build (feedback).** When the user gives feedback via `job feedback`, run
+`factory/bin/job progress <id> "feedback-<k> (round <N>)"` and spawn a fresh
+Haiku `builder` subagent with:
+`<header> Build round <N>. Port: <port>. Feedback mode: read feedback-<k>.md, address it, run factory/checks.sh, commit, push, and set STATUS: READY with ROUND and COMMIT in build.md.`
+Then run `factory/bin/job cleanup-ports <id>` and advance `build → gate`.
 
 **gate.** Run `factory/bin/gate <id>`. It prints `GATE: PASS` or `GATE: FAIL`.
 
 - PASS: `factory/bin/job advance <id> review` and go to **review**.
 - FAIL: `factory/bin/job advance <id> build`. If it refuses because this was the
-  last round, `factory/bin/job advance <id> needs-human` instead (and post the
-  PR link on Jira). Otherwise go to **build (gate-fix)**. No reviewer runs on
-  a failing build.
+  last round, `factory/bin/job advance <id> needs-human` instead (and in `jira`
+  mode post the PR link on Jira + `job jira-commented <id>`). Otherwise go to
+  **build (gate-fix)**. No reviewer runs on a failing build.
 
-**review.** Spawn all 4 mandatory reviewers (`reviewer-code`,
-`reviewer-security`, `reviewer-ux`, `reviewer-ui`) **in one message**, so they
+**review.** Read `agents.reviewers` from `job.json` (assigned by `route`:
+always `code` and `security`, plus `ux` and `ui` when `ui` surface is present
+or configured `always`). Spawn all routed reviewers **in one message**, so they
 run in parallel on `opus` (`effort: high`), prompt `<header> Review round <N>.`
-plus the port for `ux` and `ui`. **WAIT FOR ALL 4.** Each time one finishes,
-run `factory/bin/job sync <id>` so the dashboard fills in. When all 4 finish:
+plus the port for `ux` and `ui`. **WAIT FOR ALL.** Each time one finishes,
+run `factory/bin/job sync <id>` so the dashboard fills in. When all routed
+reviewers finish, run `factory/bin/job cleanup-ports <id>` to ensure no dev
+server or browser session leaked, then:
 
-- all 4 PASS: `factory/bin/job advance <id> approve`, then spawn `approver`
+- all PASS: `factory/bin/job advance <id> approve`, then spawn `approver`
   with `<header> PR: #<pr>. Final round: <N>.`
 - any CHANGES: `factory/bin/job advance <id> build` (or `needs-human` when it
   refuses because this was the last round). If `build`, go to
@@ -241,10 +262,12 @@ run `factory/bin/job sync <id>` so the dashboard fills in. When all 4 finish:
 returns (`READY` or `ESCALATE` in `decision.md`):
 
 1. Run `factory/bin/job advance <id> needs-human`. This posts the human-review
-   summary from `decision.md` as a comment on the PR and marks the draft PR
-   ready for review (`gh pr ready`). It **never** auto-merges.
-2. Post a `[factory]` comment on the Jira ticket with the PR URL and note that
-   it is ready for human review.
+   summary from `decision.md` as a comment on the PR (with a conflict warning
+   if the branch conflicts with `<base>`) and marks the draft PR ready for
+   review (`gh pr ready`). It **never** auto-merges.
+2. In `jira` mode, post a `[factory]` comment on the Jira ticket with the PR
+   URL and note that it is ready for human review, then run
+   `factory/bin/job jira-commented <id>`.
 
 A job is finished for this run when it reaches `needs-human` (PR ready for
 review), `needs-info`, `rejected`, or `merged`.
@@ -321,8 +344,21 @@ mean, ask.
   EOF
   ```
 
-  Post the reason as a `[factory]` comment on the Jira ticket via the
-  connector. The PR (if any) is closed by the script.
+  In `jira` mode, post the reason as a `[factory]` comment on the Jira ticket
+  via the connector and run `factory/bin/job jira-commented <id>`. The PR (if
+  any) is closed by the script.
+- **Cancelling an in-progress job** (stuck in `intake`, `spec`, `build`, `gate`,
+  `review`, or `approve`):
+  ```bash
+  factory/bin/job cancel <KEY> <<'EOF'
+  <reason>
+  EOF
+  ```
+  Closes any PR, removes the worktree and branch, and marks the job `rejected`.
+- **Retrying a rejected job**: run `factory/bin/job retry <KEY>` (archives the
+  old job folder cleanly) and then re-run `/factory run <KEY>`.
+- **Cleaning up merged/closed PRs and orphaned worktrees**: run
+  `factory/bin/job gc`.
 - **Refreshing codebase patterns (`/factory refresh-patterns`)**: re-audit the
   main checkout's codebase following the `factory/patterns.md` audit guidelines
   in `INSTALL.md` (keep it under ~150 lines, pointer-based with real exemplar

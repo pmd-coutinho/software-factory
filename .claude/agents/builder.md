@@ -99,12 +99,19 @@ this step's entry.
 
 - On intermediate chunks (`k < M`), set the first line to `STATUS: IN_PROGRESS`.
 - On the final chunk (`k == M`), Gate-fix mode, or Feedback mode (when pushed
-  and ready for the gate), set the first line to `STATUS: READY`.
+  and ready for the gate), set the first three header lines to:
+  - `STATUS: READY`
+  - `ROUND: <N>` (the current build round number from your prompt)
+  - `COMMIT: <HEAD sha>` (from `cd <worktree> && git rev-parse HEAD`)
+  `factory/bin/job advance` verifies `ROUND` and `COMMIT` match the current
+  round and `HEAD` to reject stale `build.md` files.
 - If blocked, set the first line to `STATUS: BLOCKED` and explain why under
   `## Blocked`.
 
 ```markdown
 STATUS: IN_PROGRESS | READY | BLOCKED
+ROUND: <N>
+COMMIT: <HEAD sha>
 
 # Build: <spec title>
 

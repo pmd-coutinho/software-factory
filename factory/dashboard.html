@@ -90,6 +90,14 @@
   .card.done { opacity: .72; }
   .card.rejected .feature { text-decoration: line-through; text-decoration-color: var(--faint); }
   .flag.wait { color: var(--changes); }
+  .flag.stale { color: var(--changes); }
+  .progress-pill {
+    display: inline-block; margin: 2px 0 6px; padding: 2px 7px; border-radius: 5px;
+    font-family: var(--mono); font-size: 10.5px; color: var(--active);
+    background: color-mix(in srgb, var(--active) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--active) 28%, transparent);
+  }
+  .cost-detail { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 6px; }
   .card-top { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
   .num { font-family: var(--mono); font-size: 12px; color: var(--muted); }
   .card-top .num { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -259,10 +267,8 @@
 </header>
 <div id="banner"></div>
 <main class="board" id="board"></main>
-<footer>
-  <span>/factory run</span>
-  <span>/factory run &lt;n&gt;</span>
-  <span>/factory &lt;anything&gt;</span>
+<footer id="footer">
+  <span id="footer-cmds">/factory run &lt;EPIC-KEY | KEY-1 ...&gt; · /factory &lt;anything&gt;</span>
   <span id="totals"></span>
 </footer>
 
@@ -273,6 +279,7 @@
       <div class="num" id="d-num"></div>
       <h3 id="d-title"></h3>
       <div class="links" id="d-links"></div>
+      <div class="cost-detail" id="d-cost"></div>
       <button class="close" data-close aria-label="Close">×</button>
     </div>
     <div class="d-body">
@@ -288,7 +295,7 @@ const COLUMNS = [
   { label: 'Intake', who: 'intake · fable', stages: ['intake', 'needs-info'] },
   { label: 'Spec', who: 'spec-writer · opus high', stages: ['spec'] },
   { label: 'Build', who: 'haiku chunks · gate', stages: ['build', 'gate'] },
-  { label: 'Review', who: '4× opus high', stages: ['review'] },
+  { label: 'Review', who: 'opus high', stages: ['review'] },
   { label: 'Summary', who: 'approver · opus high', stages: ['approve'] },
   { label: 'Ready for review', who: 'you', stages: ['needs-human'], cls: 'human' },
   { label: 'Done', who: 'merged · rejected', stages: ['merged', 'rejected'], cls: 'merged-col' },
@@ -301,12 +308,23 @@ const $ = (id) => document.getElementById(id)
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) =>
   ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c])
 
+let config = { tracker: 'jira', stale_minutes: 20 }
 let jobs = []
 let lastRender = ''
 const roundCache = new Map() // "<job>/<n>" -> verdicts of a finished round
 let openJobId = null
 let openPath = null
 let openText = null
+
+async function loadConfig() {
+  try {
+    config = { ...config, ...JSON.parse(await fetchText('config.json')) }
+  } catch { /* defaults are fine */ }
+  const cmds = config.tracker === 'github'
+    ? '/factory run · /factory run <n> · /factory <anything>'
+    : '/factory run <EPIC-KEY | KEY-1 ...> · /factory <anything>'
+  $('footer-cmds').textContent = cmds
+}
 
 async function fetchText(url) {
   const res = await fetch(url, { cache: 'no-store' })
@@ -351,11 +369,19 @@ function roundRow(job, n, v) {
   const current = n === job.round
   const cells = [chip('gate', v.gate, current && job.stage === 'gate', 'gate', 'gate')]
   if (v.gate === 'PASS') {
-    for (const r of Object.keys(job.agents.reviewers)) {
+    for (const r of Object.keys(job.agents?.reviewers || {})) {
       cells.push(chip(SHORT[r] || r, v.reviews[r], current && job.stage === 'review', r))
     }
   }
   return `<div class="round"><span class="r">R${n}</span>${cells.join('')}</div>`
+}
+
+function isStale(job) {
+  if (!LIVE.has(job.stage)) return false
+  const ref = job.progress?.updated_at || job.updated_at || job.started
+  if (!ref) return false
+  const mins = (Date.now() - new Date(ref).getTime()) / 60000
+  return mins >= (config.stale_minutes || 20)
 }
 
 function elapsed(job) {
@@ -377,27 +403,34 @@ function links(job) {
 
 function card(job, rounds) {
   const live = LIVE.has(job.stage)
+  const stale = isStale(job)
   const human = job.stage === 'needs-human'
   const done = job.stage === 'merged' || job.stage === 'rejected'
   const [num, ...slug] = job.id.split('-')
-  const flag = human ? '<span class="flag">your call</span>'
+  const flag = stale ? '<span class="flag stale">stale</span>'
+    : job.mergeable === 'CONFLICTING' ? '<span class="flag">conflicts</span>'
+    : human ? '<span class="flag">your call</span>'
     : job.stage === 'needs-info' ? '<span class="flag wait">asked author</span>'
     : job.stage === 'rejected' ? '<span class="flag wait">rejected</span>' : ''
   const risk = job.intake?.risk
   const meta = [
     risk ? `<span class="risk-${esc(risk)}">${esc(risk)}</span>` : '',
-    `<span>$${Number(job.cost_usd).toFixed(2)}</span>`,
+    `<span>$${Number(job.cost_usd || 0).toFixed(2)}</span>`,
     `<span>${elapsed(job)}</span>`,
+    job.pending_jira_comment ? '<span class="risk-medium">jira sync</span>' : '',
   ].join('')
+  const prog = live && job.progress?.label
+    ? `<div class="progress-pill">${esc(job.progress.label)}</div>` : ''
   return `
-    <article class="card ${live ? 'live' : ''} ${human ? 'human' : ''} ${done ? 'done' : ''} ${job.stage}"
+    <article class="card ${live && !stale ? 'live' : ''} ${human ? 'human' : ''} ${done ? 'done' : ''} ${job.stage}"
              data-job="${esc(job.id)}" tabindex="0">
       <div class="card-top">
-        ${live ? '<span class="pulse" aria-label="running"></span>' : ''}
+        ${live && !stale ? '<span class="pulse" aria-label="running"></span>' : ''}
         <span class="num">${esc(num)} · ${esc(slug.join('-'))}</span>
         ${flag}
       </div>
       <p class="feature">${esc(job.title)}</p>
+      ${prog}
       <div class="links">${links(job)}</div>
       ${rounds.length ? `<div class="rounds">${rounds.join('')}</div>` : ''}
       <div class="meta">${meta}</div>
@@ -408,11 +441,16 @@ function card(job, rounds) {
 async function render() {
   const problems = []
   const cards = new Map(COLUMNS.map((c) => [c, []]))
+  const unknownModels = new Set()
   for (const job of jobs) {
+    if (Array.isArray(job.unknown_models)) job.unknown_models.forEach((m) => unknownModels.add(m))
     if (!STAGES.has(job.stage)) { problems.push(`Job ${job.id} has unknown stage "${job.stage}"`); continue }
     const rounds = []
     for (let n = 1; n <= job.round; n++) rounds.push(roundRow(job, n, await roundVerdicts(job, n)))
     cards.get(COLUMNS.find((c) => c.stages.includes(job.stage))).push(card(job, rounds))
+  }
+  if (unknownModels.size) {
+    problems.push(`Unpriced model(s) in transcripts (add to factory/config.json): ${[...unknownModels].join(', ')}`)
   }
   // Newest first within a column.
   const html = COLUMNS.map((c) => `
@@ -455,10 +493,13 @@ async function loadJobs() {
   const doc = new DOMParser().parseFromString(listing, 'text/html')
   const ids = [...doc.querySelectorAll('a')]
     .map((a) => decodeURIComponent(a.getAttribute('href')))
-    .filter((h) => h.endsWith('/'))
+    .filter((h) => h.endsWith('/') && !h.startsWith('.'))
     .map((h) => h.slice(0, -1))
     .sort()
-  return Promise.all(ids.map(async (id) => JSON.parse(await fetchText(`jobs/${id}/job.json`))))
+  const loaded = await Promise.all(ids.map(async (id) => {
+    try { return JSON.parse(await fetchText(`jobs/${id}/job.json`)) } catch { return null }
+  }))
+  return loaded.filter(Boolean)
 }
 
 // ---- Drawer --------------------------------------------------------------
@@ -469,20 +510,24 @@ async function listFiles(dir) {
   const hrefs = [...doc.querySelectorAll('a')].map((a) => decodeURIComponent(a.getAttribute('href')))
   const out = []
   for (const h of hrefs) {
+    if (h.startsWith('.')) continue
     if (h.endsWith('/')) out.push(...(await listFiles(dir + h)).map((f) => h + f))
-    else if (h.endsWith('.md')) out.push(h)
+    else if (h.endsWith('.md') || h.endsWith('.log') || h === 'events.jsonl') out.push(h)
   }
   return out
 }
 
-const ORDER = ['issue.md', 'intake.md', 'spec.md', 'build.md', 'decision.md', 'rejection.md']
-const ROUND_ORDER = ['checks', 'review-code', 'review-security', 'review-ux', 'review-ui', 'merge-checks']
+const ORDER = ['issue.md', 'intake.md', 'spec.md', 'build.md', 'decision.md', 'rejection.md', 'events.jsonl']
+const ROUND_ORDER = ['checks.md', 'checks.log', 'review-code.md', 'review-security.md', 'review-ux.md', 'review-ui.md']
 
 function fileRank(path) {
   if (ORDER.includes(path)) return [0, ORDER.indexOf(path), path]
-  const round = path.match(/^round-(\d+)\/(.+)\.md$/)
-  if (round) return [2, Number(round[1]) * 10 + ROUND_ORDER.indexOf(round[2]), path]
-  return [1, 0, path] // intake-<k>.md, feedback-<k>.md
+  const round = path.match(/^round-(\d+)\/(.+)$/)
+  if (round) {
+    const idx = ROUND_ORDER.indexOf(round[2])
+    return [2, Number(round[1]) * 10 + (idx === -1 ? 9 : idx), path]
+  }
+  return [1, 0, path] // intake-<k>.md, feedback-<k>.md, decision-<k>.md
 }
 
 function sortFiles(files) {
@@ -493,10 +538,39 @@ function sortFiles(files) {
 }
 
 function tone(first) {
-  if (/^(VERDICT:\s*PASS|GATE:\s*PASS|APPROVE|STATUS:\s*READY|DECISION:\s*ACCEPT)$/.test(first)) return 'good'
-  if (/^(VERDICT:\s*CHANGES|DECISION:\s*NEEDS-INFO)$/.test(first)) return 'warn'
+  if (/^(VERDICT:\s*PASS|GATE:\s*PASS|READY|APPROVE|STATUS:\s*READY|DECISION:\s*ACCEPT)$/.test(first)) return 'good'
+  if (/^(VERDICT:\s*CHANGES|DECISION:\s*NEEDS-INFO|STATUS:\s*IN_PROGRESS)$/.test(first)) return 'warn'
   if (/^(ESCALATE|REJECTED|STATUS:\s*BLOCKED|GATE:\s*FAIL|DECISION:\s*REJECT)$/.test(first)) return 'stop'
   return null
+}
+
+function renderEvents(text) {
+  const rows = text.trim().split('\n').filter(Boolean).map((line) => {
+    try { return JSON.parse(line) } catch { return { ts: '', event: 'raw', raw: line } }
+  })
+  if (!rows.length) return '<p class="note">No events recorded yet.</p>'
+  const body = rows.map((ev) => {
+    const { ts, event, ...rest } = ev
+    const time = ts ? ts.replace('T', ' ').replace('Z', '') : ''
+    const detail = Object.entries(rest)
+      .filter(([, v]) => v !== null && v !== undefined && v !== '' && !(Array.isArray(v) && !v.length))
+      .map(([k, v]) => `${k}=${typeof v === 'object' ? JSON.stringify(v) : v}`)
+      .join(' · ')
+    return `<tr><td><code>${esc(time)}</code></td><td><strong>${esc(event)}</strong></td><td><code>${esc(detail)}</code></td></tr>`
+  }).join('')
+  return `<h2>Timeline (${rows.length} events)</h2><table><tr><th>Time (UTC)</th><th>Event</th><th>Details</th></tr>${body}</table>`
+}
+
+function formatCostDetail(job) {
+  const bd = job.cost_breakdown
+  if (!bd) return ''
+  const parts = Object.entries(bd.by_model || {}).map(([m, v]) => `${m}: $${Number(v).toFixed(2)}`)
+  const tok = bd.tokens || {}
+  const totalTok = (tok.input || 0) + (tok.output || 0) + (tok.cache_write || 0) + (tok.cache_read || 0)
+  if (totalTok > 0) {
+    parts.push(`tokens: ${Math.round(totalTok / 1000)}k (in ${Math.round((tok.input || 0) / 1000)}k · out ${Math.round((tok.output || 0) / 1000)}k · cache_r ${Math.round((tok.cache_read || 0) / 1000)}k)`)
+  }
+  return parts.join(' · ')
 }
 
 const firstLines = new Map()
@@ -504,9 +578,11 @@ const firstLines = new Map()
 async function refreshDrawer() {
   const job = jobs.find((j) => j.id === openJobId)
   if (!job) return
-  $('d-num').textContent = `${job.id} · ${job.stage}${job.round ? ` · round ${job.round}` : ''} · $${Number(job.cost_usd).toFixed(2)} · ${elapsed(job)}`
+  const prog = job.progress?.label ? ` · ${job.progress.label}` : ''
+  $('d-num').textContent = `${job.id} · ${job.stage}${job.round ? ` · round ${job.round}` : ''}${prog} · $${Number(job.cost_usd || 0).toFixed(2)} · ${elapsed(job)}`
   $('d-title').textContent = job.title
   $('d-links').innerHTML = links(job)
+  $('d-cost').textContent = formatCostDetail(job)
 
   const base = `jobs/${job.id}/`
   const files = sortFiles(await listFiles(base))
@@ -515,9 +591,9 @@ async function refreshDrawer() {
   let text = null
   if (openPath) {
     text = await fetchText(base + openPath)
-    firstLines.set(base + openPath, text.split('\n')[0].trim())
+    if (openPath.endsWith('.md')) firstLines.set(base + openPath, text.split('\n')[0].trim())
   }
-  await Promise.all(files.filter((f) => !firstLines.has(base + f)).map(async (f) => {
+  await Promise.all(files.filter((f) => f.endsWith('.md') && !firstLines.has(base + f)).map(async (f) => {
     firstLines.set(base + f, (await fetchText(base + f)).split('\n')[0].trim())
   }))
 
@@ -530,14 +606,22 @@ async function refreshDrawer() {
     const name = round
       ? `<span class="rn">R${round[1]} </span>${esc(f.split('/')[1].replace(/^review-|\.md$/g, ''))}`
       : esc(f)
-    const t = tone(firstLines.get(base + f) || '')
+    const t = f.endsWith('.md') ? tone(firstLines.get(base + f) || '') : null
     return `${head}<button class="file ${f === openPath ? 'on' : ''}" data-file="${esc(f)}">
       <span class="v ${t || ''}"></span>${name}</button>`
   }).join('') || '<div class="empty">No files yet.</div>'
 
   if (text !== openText) {
     openText = text
-    $('d-doc').innerHTML = text === null ? '<p class="note">Intake hasn’t written anything yet.</p>' : markdown(text)
+    if (text === null) {
+      $('d-doc').innerHTML = '<p class="note">Intake hasn’t written anything yet.</p>'
+    } else if (openPath === 'events.jsonl') {
+      $('d-doc').innerHTML = renderEvents(text)
+    } else if (openPath.endsWith('.log')) {
+      $('d-doc').innerHTML = `<h2>${esc(openPath)}</h2><pre><code>${esc(text)}</code></pre>`
+    } else {
+      $('d-doc').innerHTML = markdown(text)
+    }
   }
 }
 
@@ -675,7 +759,7 @@ function markdown(src) {
   return html
 }
 
-poll()
+loadConfig().then(poll)
 setInterval(poll, POLL_MS)
 </script>
 </body>

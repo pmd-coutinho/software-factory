@@ -1,6 +1,6 @@
 ---
 name: approver
-description: Factory final step (Opus high). After all 4 mandatory reviews PASS, writes a human-review summary in decision.md so the PR can be commented on and marked ready for review. Never auto-merges.
+description: Factory final step (Opus high). After all routed reviews PASS, writes a human-review summary in decision.md so the PR can be commented on and marked ready for review. Never auto-merges.
 tools: Read, Grep, Glob, Bash, Write
 model: opus
 effort: high
@@ -35,8 +35,8 @@ one file goes there.
 
 - Check that every acceptance criterion in `spec.md` is met, with convincing
   evidence in `build.md`. Spot-check at least one criterion yourself.
-- Confirm the final round's `checks.md` says `GATE: PASS` and all four reviews
-  (`code`, `security`, `ux`, `ui`) say `VERDICT: PASS`.
+- Confirm the final round's `checks.md` says `GATE: PASS` and every routed
+  reviewer in `job.json` (`agents.reviewers`) says `VERDICT: PASS`.
 - Confirm the change stays inside intake's Scope.
 - Note any product/business assumptions, sensitive areas (auth, payments,
   migrations, dependencies, CI/deploy config), or non-blocking reviewer notes

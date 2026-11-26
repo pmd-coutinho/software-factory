@@ -15,8 +15,14 @@ Usage:
   job create <KEY|N>                            new job (stdin JSON for jira; gh for github)
   job refresh <job>                             refresh issue.md (stdin JSON for jira; gh for github)
   job advance <job> <stage>                     move a job to <stage>, or refuse
+  job progress <job> <label>                    record active chunk/fix progress in job.json
+  job jira-commented <job>                      clear pending_jira_comment after posting to Jira
   job feedback <job>                            needs-human → build, with feedback (stdin) as feedback-<k>.md
   job reject <job>                              needs-info or needs-human → rejected, with reason (stdin)
+  job cancel <job>                              abort any non-terminal job → rejected, with reason (stdin)
+  job retry <job>                               archive a rejected job so the ticket can be re-queued
+  job gc                                        sync merged/closed PRs and prune orphaned worktrees
+  job cleanup-ports <job>                       stop lingering dev servers & agent-browser sessions for a job
   job agents <job> <json>                       record the reviewer agent set (called by factory/bin/route)
   job sync <job>                                refresh reviews, gate and cost from the job's files
   job summary [<job>...]                        table of jobs: ref, stage, PR, cost, time
@@ -24,10 +30,13 @@ Usage:
 <job> is a job id, a Jira ticket key (PROJ-123), or a GitHub issue number (12).
 """
 
+import contextlib
 import fcntl
 import json
 import os
 import re
+import shutil
+import signal
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -61,7 +70,8 @@ TRANSITIONS = {
     "needs-human": {"build", "rejected"},
 }
 TERMINAL = {"merged", "rejected"}
-# Any unfinished job can move to merged once a human merges its PR on GitHub.
+# Any unfinished job can move to merged once a human merges its PR on GitHub,
+# or to rejected via `job cancel` / closed PR in `job gc`.
 WAITING = {"needs-info", "needs-human"}
 CONCURRENCY = CONFIG["concurrency"]
 JIRA_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*-\d+$")
@@ -110,18 +120,40 @@ def norm_key(key):
     return str(key).strip().upper()
 
 
-# ---- Job files -------------------------------------------------------------
+# ---- Job files & locking ---------------------------------------------------
 
 
 def job_dir(job_id):
     return JOBS / job_id
 
 
+def log_event(job_id, event_type, **fields):
+    d = job_dir(job_id)
+    if not d.exists():
+        return
+    entry = {"ts": now(), "event": event_type, **fields}
+    with (d / "events.jsonl").open("a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+@contextlib.contextmanager
+def global_lock():
+    """Serialize operations that allocate job IDs or check global concurrency."""
+    JOBS.mkdir(parents=True, exist_ok=True)
+    f = open(JOBS / ".factory.lock", "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(f, fcntl.LOCK_UN)
+        f.close()
+
+
 _locks = {}
 
 
 def load(job_id):
-    """Read a job, holding its lock until this process exits."""
+    """Read a job, holding its exclusive lock until this process exits."""
     path = job_dir(job_id) / "job.json"
     if not path.exists():
         die(f"no job {job_id}")
@@ -131,7 +163,14 @@ def load(job_id):
     return json.loads(path.read_text())
 
 
+def read_unlocked(job_id):
+    """Read a job snapshot without acquiring its exclusive lock."""
+    path = job_dir(job_id) / "job.json"
+    return json.loads(path.read_text())
+
+
 def save(job):
+    job["updated_at"] = now()
     path = job_dir(job["id"]) / "job.json"
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(job, indent=2) + "\n")
@@ -139,9 +178,15 @@ def save(job):
 
 
 def all_jobs():
+    """Read snapshots of all non-hidden jobs without locking unrelated jobs."""
     if not JOBS.exists():
         return []
-    return [load(p.name) for p in sorted(JOBS.iterdir()) if (p / "job.json").exists()]
+    out = []
+    for p in sorted(JOBS.iterdir()):
+        if p.name.startswith(".") or not (p / "job.json").exists():
+            continue
+        out.append(read_unlocked(p.name))
+    return out
 
 
 def running(jobs):
@@ -161,11 +206,11 @@ def resolve(arg):
     if arg.isdigit():
         matches = [j for j in all_jobs() if str(j["issue"]) == arg]
         if matches:
-            return matches[0]
+            return load(matches[0]["id"])
     key = norm_key(arg)
     matches = [j for j in all_jobs() if norm_key(j["issue"]) == key]
     if matches:
-        return matches[0]
+        return load(matches[0]["id"])
     die(f"no job for {arg}")
 
 
@@ -195,7 +240,18 @@ def round_dir(job, n=None):
 
 
 def reviewers(job):
-    return list(job["agents"]["reviewers"])
+    return list((job.get("agents") or {}).get("reviewers") or {})
+
+
+def next_numbered(directory, prefix, suffix=".md"):
+    """Return max(existing numeric suffix) + 1 for files like `feedback-1.md`."""
+    pat = re.compile(rf"^{re.escape(prefix)}(\d+){re.escape(suffix)}$")
+    nums = []
+    for p in directory.iterdir():
+        m = pat.match(p.name)
+        if m:
+            nums.append(int(m.group(1)))
+    return max(nums, default=0) + 1
 
 
 # ---- Jira ticket → issue.md ------------------------------------------------
@@ -251,9 +307,10 @@ def write_issue_md(job, ticket):
         lines += ["", "## Comments"]
         for c in comments:
             who = c.get("author") or "unknown"
+            role = " (reporter)" if who == author and author != "unknown" else ""
             created = c.get("created") or ""
             body = c.get("body") or ""
-            lines += ["", f"### {who}" + (f", {created}" if created else ""), "", quote(body)]
+            lines += ["", f"### {who}{role}" + (f", {created}" if created else ""), "", quote(body)]
     (job_dir(job["id"]) / "issue.md").write_text("\n".join(lines) + "\n")
 
 
@@ -319,7 +376,7 @@ def github_replied_since_question(issue):
     return replied
 
 
-# ---- Cost from Claude Code transcripts -------------------------------------
+# ---- Cost from Claude Code transcripts (cached, prefix-matched, non-fatal) -
 
 
 def transcripts_dir():
@@ -328,45 +385,156 @@ def transcripts_dir():
 
 
 def prompt_text(line):
-    content = json.loads(line)["message"]["content"]
+    try:
+        content = json.loads(line)["message"]["content"]
+    except (ValueError, KeyError, TypeError):
+        return ""
     if isinstance(content, str):
         return content
     return " ".join(b.get("text", "") for b in content if isinstance(b, dict))
 
 
-def cost_usd(job):
-    """API-equivalent cost of every subagent whose prompt names this job's folder."""
-    needle = f"Job folder: {job_dir(job['id'])}/"
-    prices = CONFIG["prices_usd_per_mtok"]
-    total = 0.0
-    for path in transcripts_dir().glob("*/subagents/agent-*.jsonl"):
-        with path.open() as f:
-            first = f.readline()
-            if not first or needle not in prompt_text(first):
-                continue
-            usage_by_message = {}
-            for line in f:
+def lookup_price(model, prices):
+    """Exact match first, else longest prefix match in prices_usd_per_mtok."""
+    if model in prices:
+        return prices[model]
+    matches = [k for k in prices if model.startswith(k)]
+    if matches:
+        return prices[max(matches, key=len)]
+    return None
+
+
+def _load_cost_cache():
+    cache_path = JOBS / ".cost-cache.json"
+    if not cache_path.exists():
+        return {}
+    try:
+        return json.loads(cache_path.read_text())
+    except (ValueError, OSError):
+        return {}
+
+
+def _save_cost_cache(cache):
+    if not JOBS.exists():
+        return
+    cache_path = JOBS / ".cost-cache.json"
+    tmp = cache_path.with_suffix(".tmp")
+    try:
+        tmp.write_text(json.dumps(cache))
+        tmp.replace(cache_path)
+    except OSError:
+        pass
+
+
+def _parse_transcript(path):
+    """Return (first_prompt, {model: {in, out, w5m, w1h, read}})."""
+    by_model = {}
+    with path.open() as f:
+        first = f.readline()
+        if not first:
+            return "", by_model
+        first_prompt = prompt_text(first)
+        usage_by_message = {}
+        for line in f:
+            try:
                 entry = json.loads(line)
-                msg = entry.get("message")
-                if entry.get("type") == "assistant" and isinstance(msg, dict) and msg.get("usage"):
-                    usage_by_message[msg["id"]] = (msg["model"], msg["usage"])
-        for model, u in usage_by_message.values():
-            tokens = (u.get("input_tokens", 0) + u.get("output_tokens", 0)
-                      + u.get("cache_creation_input_tokens", 0) + u.get("cache_read_input_tokens", 0))
-            if tokens == 0:
+            except ValueError:
                 continue
-            if model not in prices:
-                die(f"no price for model {model} in factory/config.json prices_usd_per_mtok")
-            p = prices[model]
-            split = u.get("cache_creation") or {}
-            write_1h = split.get("ephemeral_1h_input_tokens", 0)
-            write_5m = u.get("cache_creation_input_tokens", 0) - write_1h
-            total += (u.get("input_tokens", 0) * p["input"]
-                      + u.get("output_tokens", 0) * p["output"]
-                      + write_5m * p["cache_write_5m"]
-                      + write_1h * p["cache_write_1h"]
-                      + u.get("cache_read_input_tokens", 0) * p["cache_read"]) / 1e6
-    return round(total, 2)
+            msg = entry.get("message")
+            if entry.get("type") == "assistant" and isinstance(msg, dict) and msg.get("usage"):
+                msg_id = msg.get("id")
+                model = msg.get("model")
+                if msg_id and model:
+                    usage_by_message[msg_id] = (model, msg["usage"])
+    for model, u in usage_by_message.values():
+        inp = u.get("input_tokens", 0)
+        out = u.get("output_tokens", 0)
+        cw = u.get("cache_creation_input_tokens", 0)
+        cr = u.get("cache_read_input_tokens", 0)
+        if inp + out + cw + cr == 0:
+            continue
+        split = u.get("cache_creation") or {}
+        w1h = split.get("ephemeral_1h_input_tokens", 0)
+        w5m = max(0, cw - w1h)
+        acc = by_model.setdefault(model, {"in": 0, "out": 0, "w5m": 0, "w1h": 0, "read": 0})
+        acc["in"] += inp
+        acc["out"] += out
+        acc["w5m"] += w5m
+        acc["w1h"] += w1h
+        acc["read"] += cr
+    return first_prompt, by_model
+
+
+def cost_usage(job):
+    """Return (total_usd, breakdown_dict, unknown_models_list) without ever crashing."""
+    tdir = transcripts_dir()
+    if not tdir.exists():
+        return 0.0, {"by_model": {}, "tokens": {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0}}, []
+    needle = f"Job folder: {job_dir(job['id'])}/"
+    prices = CONFIG.get("prices_usd_per_mtok", {})
+    cache = _load_cost_cache()
+    dirty_cache = False
+
+    by_model_usd = {}
+    tokens = {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0}
+    unknown = set()
+
+    for path in tdir.glob("*/subagents/agent-*.jsonl"):
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        key = str(path)
+        cached = cache.get(key)
+        if cached and cached.get("mtime_ns") == st.st_mtime_ns and cached.get("size") == st.st_size:
+            first_prompt = cached["first_prompt"]
+            per_model = cached["by_model"]
+        else:
+            try:
+                first_prompt, per_model = _parse_transcript(path)
+            except OSError:
+                continue
+            # Keep only the first 512 chars of the prompt in cache (header is at the very start).
+            cache[key] = {
+                "mtime_ns": st.st_mtime_ns,
+                "size": st.st_size,
+                "first_prompt": first_prompt[:512],
+                "by_model": per_model,
+            }
+            dirty_cache = True
+        if needle not in first_prompt:
+            continue
+        for model, u in per_model.items():
+            if model.startswith("<"):
+                continue
+            tokens["input"] += u["in"]
+            tokens["output"] += u["out"]
+            tokens["cache_write"] += u["w5m"] + u["w1h"]
+            tokens["cache_read"] += u["read"]
+            p = lookup_price(model, prices)
+            if p is None:
+                unknown.add(model)
+                continue
+            usd = (u["in"] * p["input"]
+                   + u["out"] * p["output"]
+                   + u["w5m"] * p["cache_write_5m"]
+                   + u["w1h"] * p["cache_write_1h"]
+                   + u["read"] * p["cache_read"]) / 1e6
+            by_model_usd[model] = by_model_usd.get(model, 0.0) + usd
+
+    if dirty_cache:
+        _save_cost_cache(cache)
+
+    if unknown:
+        print(f"job: warning: unpriced model(s) in transcripts (add to config.json prices_usd_per_mtok): "
+              f"{', '.join(sorted(unknown))}", file=sys.stderr)
+
+    total = round(sum(by_model_usd.values()), 2)
+    breakdown = {
+        "by_model": {m: round(v, 4) for m, v in sorted(by_model_usd.items())},
+        "tokens": tokens,
+    }
+    return total, breakdown, sorted(unknown)
 
 
 # ---- Sync: fields derived from files ---------------------------------------
@@ -394,7 +562,13 @@ def sync(job):
                 line = first_line(rd / f"review-{r}.md")
                 m = re.fullmatch(r"VERDICT:\s*(PASS|CHANGES)", line or "")
                 job["reviews"][r] = m.group(1) if m else ("pending" if line is None else "invalid")
-    job["cost_usd"] = cost_usd(job)
+    total, breakdown, unknown = cost_usage(job)
+    job["cost_usd"] = total
+    job["cost_breakdown"] = breakdown
+    if unknown:
+        job["unknown_models"] = unknown
+    else:
+        job.pop("unknown_models", None)
     return job
 
 
@@ -413,6 +587,10 @@ def escalate(job, why):
 
 def git(job, *args, check=True):
     return run(["git", *args], cwd=job["worktree"], check=check)
+
+
+def pr_info(job):
+    return gh_json("pr", "view", str(job["pr"]), "--json", "state,isDraft,mergeable,mergeStateStatus")
 
 
 def pr_state(job):
@@ -434,10 +612,20 @@ def next_round(job):
     job["reviews"] = {}
 
 
-def advance(job, stage):
+def cleanup_worktree(job):
+    if Path(job["worktree"]).exists():
+        run(["git", "worktree", "remove", "--force", job["worktree"]], check=False)
+    run(["git", "branch", "-D", job["branch"]], check=False)
+
+
+def advance(job, stage, allow_cancel=False):
     old = job["stage"]
-    require(stage in TRANSITIONS.get(old, set()) or (stage == "merged" and old not in TERMINAL),
-            f"{job['id']}: {old} → {stage} is not a legal transition")
+    legal = (
+        stage in TRANSITIONS.get(old, set())
+        or (stage == "merged" and old not in TERMINAL)
+        or (allow_cancel and stage == "rejected" and old not in TERMINAL)
+    )
+    require(legal, f"{job['id']}: {old} → {stage} is not a legal transition")
     d = job_dir(job["id"])
     decision = header(d / "intake.md").get("DECISION") if (d / "intake.md").exists() else None
     intake_body = lambda: "\n".join((d / "intake.md").read_text().split("\n\n", 1)[1:]).strip()
@@ -447,15 +635,21 @@ def advance(job, stage):
         if TRACKER == "github" and old == "needs-human":
             label("issue", job["issue"], remove=LABELS["needs_human"])
 
-    elif stage == "rejected" and old in WAITING:
-        require((d / "rejection.md").exists(), "use `job reject` to reject a waiting job")
+    elif stage == "rejected" and (old in WAITING or allow_cancel):
+        require((d / "rejection.md").exists(), "use `job reject` or `job cancel` to reject a job")
         if TRACKER == "github":
             reason = (d / "rejection.md").read_text().split("\n", 1)[1].strip()
             comment("issue", job["issue"], f"### Factory: rejected\n\n{reason}")
-            waiting = LABELS["needs_info"] if old == "needs-info" else LABELS["needs_human"]
-            label("issue", job["issue"], remove=f"{LABELS['queue']},{waiting}")
+            to_remove = [LABELS["queue"]]
+            if old == "needs-info":
+                to_remove.append(LABELS["needs_info"])
+            elif old == "needs-human":
+                to_remove.append(LABELS["needs_human"])
+            label("issue", job["issue"], remove=",".join(to_remove))
+        else:
+            job["pending_jira_comment"] = {"stage": "rejected", "ts": now()}
         if job["pr"]:
-            gh("pr", "close", str(job["pr"]))
+            run(["gh", "pr", "close", str(job["pr"])], check=False)
             run(["git", "push", "origin", "--delete", job["branch"]], check=False)
 
     elif old == "intake":
@@ -473,6 +667,8 @@ def advance(job, stage):
                 label("issue", job["issue"], add=LABELS["needs_info"])
             elif stage == "rejected":
                 label("issue", job["issue"], remove=LABELS["queue"])
+        else:
+            job["pending_jira_comment"] = {"stage": stage, "ts": now()}
         if stage == "spec":
             run(["git", "fetch", "origin", BASE])
             Path(job["worktree"]).parent.mkdir(parents=True, exist_ok=True)
@@ -480,7 +676,7 @@ def advance(job, stage):
 
     elif old == "needs-info":
         require_slot(job["id"])
-        k = len(list(d.glob("intake-*.md"))) + 1
+        k = next_numbered(d, "intake-")
         (d / "intake.md").rename(d / f"intake-{k}.md")
         job["intake"] = None
         if TRACKER == "github":
@@ -492,13 +688,22 @@ def advance(job, stage):
         next_round(job)
 
     elif old == "build" and stage == "gate":
-        status = first_line(d / "build.md")
+        build_md = d / "build.md"
+        require(build_md.exists(), "build.md doesn't exist")
+        bh = header(build_md)
+        status = first_line(build_md)
         require(status == "STATUS: READY", f"build.md starts with {status!r}, not STATUS: READY")
         require(not git(job, "status", "--porcelain").stdout.strip(), "the worktree has uncommitted changes")
         require(int(git(job, "rev-list", "--count", f"origin/{BASE}..HEAD").stdout) > 0,
                 f"{job['branch']} has no commits on top of origin/{BASE}")
         git(job, "fetch", "origin", job["branch"], check=False)
         head = git(job, "rev-parse", "HEAD").stdout.strip()
+        # Guard against stale STATUS: READY from a prior round or commit.
+        require(bh.get("ROUND") == str(job["round"]),
+                f"build.md has ROUND: {bh.get('ROUND')!r}, expected {job['round']} (update build.md for this round)")
+        commit_hdr = bh.get("COMMIT") or ""
+        require(len(commit_hdr) >= 7 and head.startswith(commit_hdr),
+                f"build.md has COMMIT: {commit_hdr!r}, expected HEAD {head[:7]} (update build.md for current commit)")
         res = git(job, "rev-parse", f"origin/{job['branch']}", check=False)
         remote = res.stdout.strip() if res.returncode == 0 else ""
         require(head == remote, f"{job['branch']} isn't pushed: local {head[:7]}, origin {remote[:7] or 'missing'}")
@@ -549,13 +754,14 @@ def advance(job, stage):
                 next_round(job)
 
     elif old == "approve":
+        require((d / "decision.md").exists(), "decision.md doesn't exist")
         line = first_line(d / "decision.md")
         require(line in {"READY", "ESCALATE"},
                 f"decision.md starts with {line!r}, not READY or ESCALATE")
 
     elif old == "needs-human":
-        feedback = sorted(d.glob("feedback-*.md"))
-        require(feedback and feedback[-1].stat().st_mtime > (d / "decision.md").stat().st_mtime,
+        feedback_files = list(d.glob("feedback-*.md"))
+        require(feedback_files and not (d / "decision.md").exists(),
                 "use `job feedback` to send a job back to the builder")
         job["round_limit"] = job["round"] + CONFIG["max_rounds"]
         next_round(job)
@@ -568,20 +774,31 @@ def advance(job, stage):
         heading = "### Factory: ready for review" if kind == "READY" else "### Factory: needs a human"
         body = f"{heading}\n\n{raw_decision.split(chr(10), 1)[1].strip()}"
         if job["pr"]:
+            info = pr_info(job)
+            mergeable = info.get("mergeable")
+            job["mergeable"] = mergeable
+            if mergeable == "CONFLICTING":
+                body += (
+                    f"\n\n> **Warning:** This branch currently has merge conflicts with `{BASE}`. "
+                    "Rebase or resolve conflicts before merging."
+                )
             comment_pr(job["pr"], body)
-            if gh_json("pr", "view", str(job["pr"]), "--json", "isDraft")["isDraft"]:
+            if info.get("isDraft"):
                 gh("pr", "ready", str(job["pr"]))
         elif TRACKER == "github":
             comment("issue", job["issue"], body)
         if TRACKER == "github":
             label("issue", job["issue"], add=LABELS["needs_human"])
+        else:
+            job["pending_jira_comment"] = {"stage": "needs-human", "ts": now()}
 
-    if stage in TERMINAL and Path(job["worktree"]).exists():
-        run(["git", "worktree", "remove", "--force", job["worktree"]])
-        run(["git", "branch", "-D", job["branch"]], check=False)
+    if stage in TERMINAL:
+        cleanup_worktree(job)
 
     job["stage"] = stage
+    job["progress"] = None
     job["ended"] = now() if stage in TERMINAL | WAITING else None
+    log_event(job["id"], "stage", frm=old, to=stage, round=job["round"])
     return job
 
 
@@ -593,11 +810,27 @@ def slugify(title):
     return "-".join(words) or "ticket"
 
 
-def sync_merged_prs(jobs):
-    """Move any job whose PR was merged on GitHub to `merged`."""
-    for j in jobs.values():
-        if j["stage"] not in TERMINAL and j["pr"] and pr_state(j) == "MERGED":
-            save(advance(sync(j), "merged"))
+def sync_pr_states(jobs):
+    """Move any job whose PR was merged to `merged` or closed to `rejected`."""
+    changed = []
+    for j in list(jobs.values()):
+        if j["stage"] in TERMINAL or not j["pr"]:
+            continue
+        state = pr_state(j)
+        if state == "MERGED":
+            locked = load(j["id"])
+            save(advance(sync(locked), "merged"))
+            jobs[norm_key(j["issue"])] = locked
+            changed.append((j["id"], "merged"))
+        elif state == "CLOSED":
+            locked = load(j["id"])
+            (job_dir(locked["id"]) / "rejection.md").write_text(
+                f"REJECTED\n\nPR #{locked['pr']} was closed without merging on GitHub.\n"
+            )
+            save(advance(sync(locked), "rejected", allow_cancel=True))
+            jobs[norm_key(j["issue"])] = locked
+            changed.append((j["id"], "rejected (PR closed)"))
+    return changed
 
 
 def cmd_create(ref_arg):
@@ -605,60 +838,64 @@ def cmd_create(ref_arg):
         if not ref_arg.isdigit():
             die(f"github tracker expects a numeric issue number, got {ref_arg!r}")
         number = int(ref_arg)
-        existing = [j for j in all_jobs() if str(j["issue"]) == str(number)]
-        if existing:
-            die(f"issue #{number} already has job {existing[0]['id']} ({existing[0]['stage']})")
-        try:
-            require_slot(None)
-        except Refused as e:
-            die(str(e))
         issue = fetch_github_issue(number)
         if issue["state"] != "OPEN":
             die(f"issue #{number} is {issue['state'].lower()}")
         if LABELS["queue"] not in {l["name"] for l in issue["labels"]}:
             die(f"issue #{number} isn't labeled {LABELS['queue']}")
-        JOBS.mkdir(parents=True, exist_ok=True)
-        numbers = [int(p.name.split("-")[0]) for p in JOBS.iterdir() if p.name[:3].isdigit()]
-        job_id = f"{max(numbers, default=0) + 1:03d}-{slugify(issue['title'])}"
-        job_dir(job_id).mkdir()
-        job = {
-            "id": job_id, "issue": issue["number"], "title": issue["title"], "issue_url": issue["url"],
-            "pr": None, "pr_url": None,
-            "branch": f"factory/{job_id}",
-            "worktree": str(REPO / ".worktrees" / job_id),
-            "stage": "intake", "round": 0, "round_limit": CONFIG["max_rounds"],
-            "intake": None, "agents": None, "gate": None, "reviews": {},
-            "cost_usd": 0.0, "started": now(), "ended": None,
-        }
-        write_github_issue_md(job)
-        save(job)
+        with global_lock():
+            existing = [j for j in all_jobs() if str(j["issue"]) == str(number)]
+            if existing:
+                die(f"issue #{number} already has job {existing[0]['id']} ({existing[0]['stage']})")
+            require_slot(None)
+            JOBS.mkdir(parents=True, exist_ok=True)
+            numbers = [int(p.name.split("-")[0]) for p in JOBS.iterdir()
+                       if not p.name.startswith(".") and p.name[:3].isdigit()]
+            job_id = f"{max(numbers, default=0) + 1:03d}-{slugify(issue['title'])}"
+            job_dir(job_id).mkdir()
+            job = {
+                "id": job_id, "issue": issue["number"], "title": issue["title"], "issue_url": issue["url"],
+                "pr": None, "pr_url": None,
+                "branch": f"factory/{job_id}",
+                "worktree": str(REPO / ".worktrees" / job_id),
+                "stage": "intake", "round": 0, "round_limit": CONFIG["max_rounds"],
+                "intake": None, "agents": None, "gate": None, "reviews": {},
+                "progress": None, "pending_jira_comment": None,
+                "cost_usd": 0.0, "cost_breakdown": {"by_model": {}, "tokens": {}},
+                "started": now(), "updated_at": now(), "ended": None,
+            }
+            write_github_issue_md(job)
+            save(job)
+            log_event(job_id, "create", issue=issue["number"], tracker="github")
         print(job_id)
         return
 
     ticket = parse_ticket_stdin(expected_key=ref_arg)
     key = ticket["key"]
-    existing = [j for j in all_jobs() if norm_key(j["issue"]) == key]
-    if existing:
-        die(f"{key} already has job {existing[0]['id']} ({existing[0]['stage']})")
-    try:
+    with global_lock():
+        existing = [j for j in all_jobs() if norm_key(j["issue"]) == key]
+        if existing:
+            die(f"{key} already has job {existing[0]['id']} ({existing[0]['stage']})")
         require_slot(None)
-    except Refused as e:
-        die(str(e))
-    JOBS.mkdir(parents=True, exist_ok=True)
-    numbers = [int(p.name.split("-")[0]) for p in JOBS.iterdir() if p.name[:3].isdigit()]
-    job_id = f"{max(numbers, default=0) + 1:03d}-{key.lower()}-{slugify(ticket['title'])}"
-    job_dir(job_id).mkdir()
-    job = {
-        "id": job_id, "issue": key, "title": ticket["title"], "issue_url": ticket.get("url") or "",
-        "pr": None, "pr_url": None,
-        "branch": f"factory/{job_id}",
-        "worktree": str(REPO / ".worktrees" / job_id),
-        "stage": "intake", "round": 0, "round_limit": CONFIG["max_rounds"],
-        "intake": None, "agents": None, "gate": None, "reviews": {},
-        "cost_usd": 0.0, "started": now(), "ended": None,
-    }
-    write_issue_md(job, ticket)
-    save(job)
+        JOBS.mkdir(parents=True, exist_ok=True)
+        numbers = [int(p.name.split("-")[0]) for p in JOBS.iterdir()
+                   if not p.name.startswith(".") and p.name[:3].isdigit()]
+        job_id = f"{max(numbers, default=0) + 1:03d}-{key.lower()}-{slugify(ticket['title'])}"
+        job_dir(job_id).mkdir()
+        job = {
+            "id": job_id, "issue": key, "title": ticket["title"], "issue_url": ticket.get("url") or "",
+            "pr": None, "pr_url": None,
+            "branch": f"factory/{job_id}",
+            "worktree": str(REPO / ".worktrees" / job_id),
+            "stage": "intake", "round": 0, "round_limit": CONFIG["max_rounds"],
+            "intake": None, "agents": None, "gate": None, "reviews": {},
+            "progress": None, "pending_jira_comment": None,
+            "cost_usd": 0.0, "cost_breakdown": {"by_model": {}, "tokens": {}},
+            "started": now(), "updated_at": now(), "ended": None,
+        }
+        write_issue_md(job, ticket)
+        save(job)
+        log_event(job_id, "create", issue=key, tracker="jira")
     print(job_id)
 
 
@@ -668,6 +905,7 @@ def cmd_refresh(job):
         job["title"] = issue["title"]
         job["issue_url"] = issue["url"]
         save(job)
+        log_event(job["id"], "refresh", issue=issue["number"])
         print(f"{job['id']}: refreshed issue.md from #{issue['number']}")
         return
     ticket = parse_ticket_stdin(expected_key=job["issue"])
@@ -676,12 +914,31 @@ def cmd_refresh(job):
         job["issue_url"] = ticket["url"]
     write_issue_md(job, ticket)
     save(job)
+    log_event(job["id"], "refresh", issue=ticket["key"])
     print(f"{job['id']}: refreshed issue.md from {ticket['key']}")
+
+
+def cmd_progress(job, label_text):
+    text = label_text.strip()
+    if not text:
+        die("progress label cannot be empty")
+    job["progress"] = {"label": text, "updated_at": now()}
+    save(job)
+    log_event(job["id"], "progress", stage=job["stage"], round=job["round"], label=text)
+    print(f"{job['id']}: {text}")
+
+
+def cmd_jira_commented(job):
+    prev = job.get("pending_jira_comment")
+    job["pending_jira_comment"] = None
+    save(job)
+    log_event(job["id"], "jira_commented", stage=prev["stage"] if prev else job["stage"])
+    print(f"{job['id']}: cleared pending_jira_comment")
 
 
 def cmd_queue_github(args):
     jobs = {str(j["issue"]): j for j in all_jobs()}
-    sync_merged_prs(jobs)
+    sync_pr_states(jobs)
     issues = gh_json("issue", "list", "--label", LABELS["queue"], "--state", "open",
                      "--limit", "200", "--json", "number,title")
     if args:
@@ -717,11 +974,14 @@ def cmd_queue_github(args):
             other_rows.append(("wait", n, j["id"], j["stage"], f"review/merge PR #{j['pr']}, or give feedback"
                                if j["pr"] else "give feedback"))
         elif j["stage"] == "rejected":
-            other_rows.append(("skip", n, j["id"], j["stage"], f"rejected; delete factory/jobs/{j['id']} to retry"))
+            other_rows.append(("skip", n, j["id"], j["stage"], f"rejected; run `job retry {j['id']}` to retry"))
         elif j["stage"] == "merged":
             other_rows.append(("skip", n, j["id"], j["stage"], "merged"))
         else:
-            running_rows.append(("resume", n, j["id"], j["stage"], f"round {j['round']}"))
+            note = f"round {j['round']}"
+            if j.get("progress"):
+                note += f" ({j['progress']['label']})"
+            running_rows.append(("resume", n, j["id"], j["stage"], note))
     if not args:
         for n, j in sorted(jobs.items()):
             if n not in open_numbers and j["stage"] not in TERMINAL | WAITING:
@@ -763,27 +1023,31 @@ def cmd_queue(args):
         die("queue requires at least one Jira ticket key (e.g. `job queue PROJ-101 PROJ-102`)")
 
     jobs = {norm_key(j["issue"]): j for j in all_jobs()}
-    sync_merged_prs(jobs)
+    sync_pr_states(jobs)
 
     running_rows, replied_rows, new_rows, other_rows = [], [], [], []
     for key in keys:
         j = jobs.get(key)
+        pending_note = " [jira comment pending]" if j and j.get("pending_jira_comment") else ""
         if not j:
             new_rows.append(("new", key, "-", "-", "not started"))
         elif j["stage"] == "needs-info":
             if key in replied:
-                replied_rows.append(("resume", key, j["id"], j["stage"], "author replied on Jira"))
+                replied_rows.append(("resume", key, j["id"], j["stage"], "author replied on Jira" + pending_note))
             else:
-                other_rows.append(("wait", key, j["id"], j["stage"], "waiting for author reply on Jira"))
+                other_rows.append(("wait", key, j["id"], j["stage"], "waiting for author reply on Jira" + pending_note))
         elif j["stage"] == "needs-human":
-            other_rows.append(("wait", key, j["id"], j["stage"], f"review/merge PR #{j['pr']}, or give feedback"
-                               if j["pr"] else "give feedback"))
+            base_note = f"review/merge PR #{j['pr']}, or give feedback" if j["pr"] else "give feedback"
+            other_rows.append(("wait", key, j["id"], j["stage"], base_note + pending_note))
         elif j["stage"] == "rejected":
-            other_rows.append(("skip", key, j["id"], j["stage"], f"rejected; delete factory/jobs/{j['id']} to retry"))
+            other_rows.append(("skip", key, j["id"], j["stage"], f"rejected; run `job retry {j['id']}` to retry" + pending_note))
         elif j["stage"] == "merged":
             other_rows.append(("skip", key, j["id"], j["stage"], "merged"))
         else:
-            running_rows.append(("resume", key, j["id"], j["stage"], f"round {j['round']}"))
+            note = f"round {j['round']}"
+            if j.get("progress"):
+                note += f" ({j['progress']['label']})"
+            running_rows.append(("resume", key, j["id"], j["stage"], note + pending_note))
 
     # Jobs already in a running stage hold a slot whether or not an agent is on them.
     slots = CONCURRENCY - len(running(jobs.values()))
@@ -801,16 +1065,23 @@ def cmd_queue(args):
 def cmd_status():
     """List all local jobs and their stages."""
     jobs = {norm_key(j["issue"]): j for j in all_jobs()}
-    sync_merged_prs(jobs)
+    sync_pr_states(jobs)
+    tracker_name = "GitHub" if TRACKER == "github" else "Jira"
     for j in all_jobs():
         note = ""
         if j["stage"] == "needs-human":
             note = f"review/merge PR #{j['pr']}, or give feedback" if j["pr"] else "give feedback"
+            if j.get("mergeable") == "CONFLICTING":
+                note += " [CONFLICTS]"
         elif j["stage"] == "needs-info":
-            note = "waiting for author reply on Jira"
+            note = f"waiting for author reply on {tracker_name}"
         elif j["stage"] not in TERMINAL:
             note = f"round {j['round']}"
-        print("\t".join((j["stage"], str(j["issue"]), j["id"], f"PR #{j['pr']}" if j["pr"] else "-", note)))
+            if j.get("progress"):
+                note += f" ({j['progress']['label']})"
+        if j.get("pending_jira_comment"):
+            note += f" [jira comment pending: {j['pending_jira_comment']['stage']}]"
+        print("\t".join((j["stage"], str(j["issue"]), j["id"], f"PR #{j['pr']}" if j["pr"] else "-", note.strip())))
 
 
 def cmd_feedback(job, text):
@@ -819,20 +1090,112 @@ def cmd_feedback(job, text):
     if not text.strip():
         die("no feedback on stdin")
     d = job_dir(job["id"])
-    k = len(list(d.glob("feedback-*.md"))) + 1
-    (d / f"feedback-{k}.md").write_text(f"# Feedback {k}\n\nFrom @{operator()} after the PR was raised.\n\n{text.strip()}\n")
+    k = next_numbered(d, "feedback-")
+    (d / f"feedback-{k}.md").write_text(
+        f"# Feedback {k}\n\nFrom @{operator()} after the PR was raised.\n\n{text.strip()}\n"
+    )
+    decision = d / "decision.md"
+    if decision.exists():
+        dk = next_numbered(d, "decision-")
+        decision.rename(d / f"decision-{dk}.md")
+    log_event(job["id"], "feedback", index=k)
     save(advance(sync(job), "build"))
     print(f"{job['id']}: feedback-{k}.md, round {job['round']}")
 
 
 def cmd_reject(job, text):
     if job["stage"] not in WAITING:
-        die(f"{job['id']} is in {job['stage']}, not needs-info or needs-human")
+        die(f"{job['id']} is in {job['stage']}, not needs-info or needs-human (use `job cancel` for running jobs)")
     if not text.strip():
         die("no reason on stdin")
-    (job_dir(job["id"]) / "rejection.md").write_text(f"REJECTED\n\nBy @{operator()} while the job was {job['stage']}.\n\n{text.strip()}\n")
+    (job_dir(job["id"]) / "rejection.md").write_text(
+        f"REJECTED\n\nBy @{operator()} while the job was {job['stage']}.\n\n{text.strip()}\n"
+    )
+    log_event(job["id"], "reject", from_stage=job["stage"])
     save(advance(sync(job), "rejected"))
     print(f"{job['id']}: rejected")
+
+
+def cmd_cancel(job, text):
+    if job["stage"] in TERMINAL:
+        die(f"{job['id']} is already {job['stage']}")
+    reason = text.strip() or "Cancelled by operator."
+    (job_dir(job["id"]) / "rejection.md").write_text(
+        f"REJECTED\n\nCancelled by @{operator()} while the job was {job['stage']}.\n\n{reason}\n"
+    )
+    log_event(job["id"], "cancel", from_stage=job["stage"])
+    save(advance(sync(job), "rejected", allow_cancel=True))
+    print(f"{job['id']}: cancelled (rejected)")
+
+
+def cmd_retry(job):
+    if job["stage"] != "rejected":
+        die(f"{job['id']} is in {job['stage']}, only rejected jobs can be retried")
+    cleanup_worktree(job)
+    archive_dir = JOBS / ".archived"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    dest = archive_dir / f"{job['id']}-{ts}"
+    # Release lock file before moving directory.
+    if job["id"] in _locks:
+        f = _locks.pop(job["id"])
+        fcntl.flock(f, fcntl.LOCK_UN)
+        f.close()
+    shutil.move(str(job_dir(job["id"])), str(dest))
+    print(f"{job['id']}: archived to {dest.relative_to(REPO)}; re-run queue/create to retry {job['issue']}")
+
+
+def cmd_gc():
+    jobs = {norm_key(j["issue"]): j for j in all_jobs()}
+    changed = sync_pr_states(jobs)
+    active_ids = {j["id"] for j in all_jobs() if j["stage"] not in TERMINAL}
+    pruned = []
+    wt_root = REPO / ".worktrees"
+    if wt_root.exists():
+        for p in sorted(wt_root.iterdir()):
+            if p.is_dir() and p.name not in active_ids:
+                run(["git", "worktree", "remove", "--force", str(p)], check=False)
+                if p.exists():
+                    shutil.rmtree(p, ignore_errors=True)
+                pruned.append(p.name)
+    run(["git", "worktree", "prune"], check=False)
+    parts = []
+    if changed:
+        parts.append("synced: " + ", ".join(f"{jid}→{st}" for jid, st in changed))
+    if pruned:
+        parts.append("pruned worktrees: " + ", ".join(pruned))
+    print("gc: " + ("; ".join(parts) if parts else "nothing to clean up"))
+
+
+def cmd_cleanup_ports(job):
+    m = re.match(r"^(\d+)-", job["id"])
+    if not m:
+        die(f"cannot derive port slot from job id {job['id']!r}")
+    n = int(m.group(1))
+    ports_cfg = CONFIG.get("ports", {"base": 5100, "step": 10})
+    base = ports_cfg["base"] + ports_cfg["step"] * n
+    ports = [base, base + 1, base + 2]
+    killed = []
+    for port in ports:
+        res = subprocess.run(["lsof", f"-tiTCP:{port}", "-sTCP:LISTEN"], capture_output=True, text=True)
+        for line in res.stdout.splitlines():
+            line = line.strip()
+            if line.isdigit():
+                pid = int(line)
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                    killed.append(f"{pid}@{port}")
+                except OSError:
+                    pass
+    closed = []
+    if shutil.which("agent-browser"):
+        for role in ("builder", "ux", "ui"):
+            sess = f"{job['id']}-{role}"
+            r = subprocess.run(["agent-browser", "--session", sess, "close"], capture_output=True, text=True)
+            if r.returncode == 0:
+                closed.append(sess)
+    log_event(job["id"], "cleanup_ports", ports=ports, killed=killed, closed_browsers=closed)
+    print(f"{job['id']}: ports {ports} (killed: {', '.join(killed) or 'none'}; browsers closed: {', '.join(closed) or 'none'})")
 
 
 def cmd_agents(job, spec):
@@ -840,6 +1203,7 @@ def cmd_agents(job, spec):
         die(f"{job['id']}: route only an intake job that intake ACCEPTed")
     job["agents"] = json.loads(spec)
     save(job)
+    log_event(job["id"], "route", reviewers=list((job["agents"].get("reviewers") or {}).keys()))
 
 
 def elapsed(job):
@@ -884,10 +1248,22 @@ def main(argv):
             job = advance(sync(resolve(args[0])), args[1])
             save(sync(job))
             print(f"{job['id']}: {job['stage']} (round {job['round']})")
+        elif cmd == "progress" and len(args) >= 2:
+            cmd_progress(resolve(args[0]), " ".join(args[1:]))
+        elif cmd == "jira-commented" and len(args) == 1:
+            cmd_jira_commented(resolve(args[0]))
         elif cmd == "feedback" and len(args) == 1:
             cmd_feedback(resolve(args[0]), sys.stdin.read())
         elif cmd == "reject" and len(args) == 1:
             cmd_reject(resolve(args[0]), sys.stdin.read())
+        elif cmd == "cancel" and len(args) == 1:
+            cmd_cancel(resolve(args[0]), sys.stdin.read())
+        elif cmd == "retry" and len(args) == 1:
+            cmd_retry(resolve(args[0]))
+        elif cmd == "gc" and not args:
+            cmd_gc()
+        elif cmd == "cleanup-ports" and len(args) == 1:
+            cmd_cleanup_ports(resolve(args[0]))
         elif cmd == "agents" and len(args) == 2:
             cmd_agents(sync(resolve(args[0])), args[1])
         elif cmd == "sync" and len(args) == 1:

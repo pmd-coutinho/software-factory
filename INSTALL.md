@@ -27,6 +27,9 @@ Then stop and tell the user if any of these fail:
 - `claude --version` is 2.1.257 or later (the intake agent runs on Fable).
 - `python3 --version` is 3.10 or later. The scripts use only the standard
   library.
+- If the project has a web UI: check whether `agent-browser` is installed
+  (`command -v agent-browser`). If missing, warn the user that UI/UX browser
+  checks will be skipped until `agent-browser` is installed.
 - None of the files in step 1 already exist. If one does, show the user the
   clash and ask before overwriting.
 
@@ -109,14 +112,20 @@ How to audit:
 - `tracker`: set to `"jira"` or `"github"` based on step 0.
 - `base_branch`: the default branch.
 - `labels`: used when `tracker` is `"github"` (ignored for `"jira"`).
-- `protected_paths`: keep the two factory entries and don't add the project's
+- `protected_paths`: keep all six factory entries (`factory/checks.sh`,
+  `factory/config.json`, `factory/bin/*`, `factory/patterns.md`,
+  `.claude/agents/*`, `.claude/skills/factory/*`) and don't add the project's
   tests. Features legitimately change existing tests (a new required field
   changes every fixture), and a protected test blocks the job with no way
   through. The code reviewer catches weakened or special-cased tests instead.
   Add a path only when no job should ever change it. They are fnmatch
   patterns, so `*` also matches `/`.
+- `gate_timeout_seconds`: default `600` (10 minutes); raise if the repo's full
+  check suite legitimately takes longer.
+- `reviewers`: `code` and `security` are `"when": "always"`; `ux` and `ui` are
+  `"when": "surface:ui"` (change to `"always"` if you want all four on every job).
 - `ports`: move `base` if the project already uses ports 5100–5199.
-- Leave `concurrency`, `max_rounds`, `reviewers`, `reviewer_effort` and
+- Leave `concurrency`, `max_rounds`, `stale_minutes`, `reviewer_effort` and
   `prices_usd_per_mtok` as they are unless the user asks.
 
 **Agents.** The checklists are general on purpose. Tailor them to the stack

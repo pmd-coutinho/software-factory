@@ -47,13 +47,18 @@ If your prompt indicates this is the final finding (`Fix <T> of <T>`):
    fix the regression, commit, and re-run until it passes (or write
    `STATUS: BLOCKED` in `build.md`).
 2. Push the branch: `cd <worktree> && git push -u origin <branch>`.
-3. Set the first line of `<job folder>/build.md` to `STATUS: READY` and update
-   `## Summary`, `## Changes`, and `## Validation`.
+3. Update the top header lines of `<job folder>/build.md` to:
+   ```
+   STATUS: READY
+   ROUND: <N>
+   COMMIT: <HEAD sha from git rev-parse HEAD>
+   ```
+   and update `## Summary`, `## Changes`, and `## Validation`.
 
 For intermediate findings (`i < T`), keep the first line of `build.md` as
-`STATUS: IN_PROGRESS` and append a bullet under `## Log` → `### Round <N>`
-recording the reviewer, finding, commit hash, and fix (or why no change was
-needed).
+`STATUS: IN_PROGRESS` (with current `ROUND` and `COMMIT`) and append a bullet
+under `## Log` → `### Round <N>` recording the reviewer, finding, commit hash,
+and fix (or why no change was needed).
 
 When you're done, reply with one line: `FIXED <i>/<T>: <short summary>` (or
 `STATUS: BLOCKED`).

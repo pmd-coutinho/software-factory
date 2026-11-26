@@ -5,7 +5,8 @@ Atlassian/Jira MCP connector) or **GitHub Issues** — chosen at install time in
 `factory/config.json` (`"tracker": "jira" | "github"`). Agents decide whether
 each ticket/issue is worth building, write a chunked spec on Opus (high),
 execute each chunk sequentially on Haiku, test it with your own checks, run
-all four mandatory Opus (high) reviewers, fix review findings point by point
+Opus (high) reviewers (`code` + `security` always, plus `ux` + `ui` on UI
+surfaces, configurable in `config.json`), fix review findings point by point
 on Haiku, write a human-review summary on the PR, and mark the PR ready for
 review (never auto-merging).
 
@@ -30,24 +31,24 @@ You need Claude Code 2.1.257 or later, `python3`, and an authenticated
 ## The loop
 
 ```
-Jira epic or space-separated ticket keys (Atlassian/Jira MCP connector)
+Jira epic / ticket keys (Atlassian MCP)  OR  GitHub issues labeled `factory` (`gh`)
         │
         ▼
-intake (fable)          ── NEEDS-INFO → asks the reporter on Jira, waits for a reply
-        │                  REJECT     → says why on Jira
+intake (fable)          ── NEEDS-INFO → asks the reporter, waits for a reply
+        │                  REJECT     → says why on ticket/issue
         ▼ ACCEPT, maybe rescoped; rates risk + surfaces
-route (script)          assigns all 4 mandatory reviewers on opus (high)
+route (script)          assigns reviewers from config.json (code + security always; ux + ui on `ui` surface)
         ▼
 spec-writer (opus high) → spec.md with small, ordered chunks
         ▼
 builder (haiku)         → runs each chunk sequentially on the same worktree;
         │                 final chunk pushes + opens a draft PR
         ▼                 ▲
-gate (script) ──FAIL──────┤  factory/checks.sh; no reviewer runs on a failing build
+gate (script) ──FAIL──────┤  clean-tree + protected-paths + timed factory/checks.sh
         ▼ PASS            │
-reviewers (4× opus high)  │  code, security, ux, ui (ALL 4 MANDATORY) in parallel
-        │   └─CHANGES─────┘  Haiku review-fixer subagents fix findings point by point
-        ▼ all 4 PASS
+reviewers (opus high)     │  routed reviewers in parallel
+        │   └─CHANGES─────┘  deduplicated Haiku review-fixer subagents fix findings point by point
+        ▼ all PASS
 approver (opus high)    → writes human-review summary on PR → marks PR ready (NO auto-merge)
 ```
 
@@ -79,54 +80,34 @@ You approve by merging the PR on GitHub—the factory never auto-merges. To
 change a PR, tell the factory what you want with `/factory`. To drop a job
 that waits on you or on its reporter, tell the factory to reject it.
 
-## The guide
-
-This folder is the companion to **A Developer's Guide to Software Factories**,
-a short PDF on how factories like this one work and how to run yours. I'll send
-you a copy when you [sign up to my newsletter](https://zazencodes.com/newsletter?utm_source=github&utm_medium=referral&utm_campaign=software-factory-claude-code-v2).
-
-<p align="center">
-  <a href="https://zazencodes.com/newsletter?utm_source=github&utm_medium=referral&utm_campaign=software-factory-claude-code-v2">
-    <img
-      src="docs/assets/software-factories-guide-promo.png"
-      alt="Software Factories — a developer's guide to issue-driven pipelines for coding agents"
-      width="100%"
-    >
-  </a>
-  <br>
-  <a href="https://zazencodes.com/newsletter?utm_source=github&utm_medium=referral&utm_campaign=software-factory-claude-code-v2">Get the free PDF</a>
-</p>
-
 ## What's in here
 
 ```
 .claude/
-  skills/factory/SKILL.md     the orchestrator: Jira connector, concurrency, the pipeline
+  skills/factory/SKILL.md     the orchestrator: Jira/GitHub queue, concurrency, the pipeline
   agents/
     intake.md                 fable       worth building? at what scope? risk + surfaces
     spec-writer.md            opus high   spec.md with chunked implementation plan
     builder.md                haiku       executes spec chunks sequentially, commits, draft PR
     review-fixer.md           haiku       fixes review findings point by point
-    reviewer-code.md          opus high   mandatory: correctness, simplicity, tests
-    reviewer-security.md      opus high   mandatory: security
-    reviewer-ux.md            opus high   mandatory: user experience
-    reviewer-ui.md            opus high   mandatory: visual design
+    reviewer-code.md          opus high   always-on: correctness, simplicity, tests
+    reviewer-security.md      opus high   always-on: security
+    reviewer-ux.md            opus high   ui surface (or always): user experience
+    reviewer-ui.md            opus high   ui surface (or always): visual design
     approver.md               opus high   writes human-review summary on PR (no auto-merge)
 factory/
-  config.json                 concurrency, rounds, mandatory reviewers, protected paths, prices
+  config.json                 concurrency, rounds, reviewer routing, timeouts, protected paths, prices
   checks.sh                   your repo's checks (the installer fills it in)
   patterns.md                 curated codebase patterns, exemplars & primitives (installer audits & fills)
-  bin/job                     the only writer of job.json; refuses illegal moves; marks PR ready
-  bin/gate                    runs checks.sh in a job's worktree → round-N/checks.md
-  bin/route                   assigns all 4 mandatory Opus (high) reviewers
-  dashboard.html              the board
-examples/jobs/                finished jobs from a real run
+  bin/job                     the only writer of job.json; guards, events, progress, cancel/retry/gc
+  bin/gate                    clean-tree + protected-paths + timed checks.sh → round-N/checks.md
+  bin/route                   assigns Opus (high) reviewers based on config.json & intake surfaces
+  dashboard.html              the board (cards, chunk/fix progress, timeline, cost breakdown, logs)
 INSTALL.md                    instructions for the installing agent
 DESIGN.md                     how it works and why
 ```
 
-[`DESIGN.md`](DESIGN.md) explains each decision and lists what changed from
-[v1](../software-factory-claude-code).
+[`DESIGN.md`](DESIGN.md) explains each decision and lists what changed from v1.
 
 ## Dashboard
 
@@ -134,65 +115,32 @@ DESIGN.md                     how it works and why
 cd factory && python3 -m http.server
 ```
 
-Open <http://localhost:8000/dashboard.html>. Each job is a card with its issue
-and PR, a row of gate and review chips per round, its risk, cost and
-time. Click a card to read every file the job wrote; each one opens with a
-short summary of what happened in that step. To see the example
-jobs, copy `examples/jobs/` to `factory/jobs/` first.
+Open <http://localhost:8000/dashboard.html>. Each job is a card with its
+ticket/issue and PR, active chunk/fix progress, a row of gate and review chips
+per round, its risk, cost, stale indicator, and elapsed time. Click a card to
+read every file the job wrote (including `checks.log` and the `events.jsonl`
+timeline); each markdown file opens with a short summary of what happened in
+that step.
 
-Cost is the API-equivalent price of each job's agents, read from Claude Code's
-transcripts. On a subscription plan it shows where the spend goes, not what
-you're billed.
-
-## The example jobs
-
-They come from a test run on a small private calculator repo, with
-`concurrency: 2` and every agent on Haiku to keep it cheap.
-
-- **001-add-a-subtract-function**: low risk, no UI, so only the code reviewer
-  ran. Approved and merged through its PR.
-- **002-show-a-history-of**: a UI change, so the UX and UI reviewers ran too.
-  Merged.
-- **003-add-multiply-divide-power**: intake cut an oversized "scientific
-  calculator" issue down to three functions. The gate failed round 1 because
-  the builder edited a protected test file, and the job went to a human after
-  three rounds.
-- **005-add-a-crypto-miner**: rejected at intake.
+Cost is the API-equivalent price of each job's agents, cached from Claude Code's
+transcripts with per-model and token breakdowns. On a subscription plan it shows
+where the spend goes, not what you're billed.
 
 ## Cost and safety
 
-- It opens and merges real PRs and runs on your Claude plan. Start with
-  `concurrency: 1` and read every PR until you trust it.
-- Intake runs on Fable once per issue. Depending on your plan, Fable can bill
-  to usage credits rather than your plan's included usage.
-- Only issues labeled `factory` run, and only people with triage or write
-  access can add labels. Issue text reaches the agents as quoted data, never
-  as their instructions.
-- The factory pushes only `factory/*` branches, merges only through
-  `gh pr merge`, and never deploys.
-
-## More from ZazenCodes
-
-- **Agentic Coding Fundamentals**, the full course:
-  <https://zazencodes.com/courses/agentic-coding-fundamentals>
-- **Newsletter**, one email a week: <https://zazencodes.com/newsletter>
-- **YouTube**: <https://youtube.com/@ZazenCodes>
+- It opens real PRs and runs on your Claude plan. Start with `concurrency: 1`
+  and read every PR until you trust it.
+- Intake runs on Fable once per ticket/issue. Depending on your plan, Fable can
+  bill to usage credits rather than your plan's included usage.
+- In `jira` mode, only explicitly named tickets/epics run. In `github` mode,
+  only issues labeled `factory` run (labels need triage or write access). Ticket
+  text reaches agents as quoted data in `issue.md`, never as their instructions.
+- `protected_paths` blocks branches from modifying factory scripts, checks,
+  config, patterns, or agent/skill definitions.
+- The factory pushes only `factory/*` branches, never auto-merges, and never
+  deploys.
 
 ## License
 
 [GPLv3](LICENSE). You can use, modify and share this code, and any version you
 distribute must also be released under GPLv3.
-
-Want to use this in closed-source or commercial software? Get in touch for a commercial license.
-
-<p align="center">
-  <a href="https://zazencodes.com/?utm_source=github&utm_medium=referral&utm_campaign=software-factory-claude-code-v2">
-    <img
-      src="docs/assets/zazencodes-banner.png"
-      alt="ZazenCodes — Engineering for the Agentic Era"
-      width="100%"
-    >
-  </a>
-  <br>
-  Created by <a href="https://zazencodes.com/">ZazenCodes</a>
-</p>

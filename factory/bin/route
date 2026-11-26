@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Assign the mandatory reviewer set from config.json to an accepted job.
+"""Assign the reviewer set from config.json to an accepted job.
 
 Usage: route <job-id>
 
-All four reviewers (code, security, ux, ui) are mandatory and run on opus
-(effort: high). Records the agent set in job.json with `job agents`.
+Each entry in config.json `reviewers` is either:
+  - a string model name (e.g. "opus"), treated as always-on, or
+  - {"model": "opus", "when": "always" | "surface:<name>"}
+
+Records the selected agent set in job.json with `job agents`.
 """
 
 import json
@@ -21,6 +24,36 @@ def die(msg):
     sys.exit(1)
 
 
+def select_reviewers(config_reviewers, surfaces):
+    """Return (selected_dict, skipped_list) based on config rules and intake surfaces."""
+    selected = {}
+    skipped = []
+    surface_set = set(surfaces or [])
+    for name, spec in config_reviewers.items():
+        if isinstance(spec, str):
+            model, when = spec, "always"
+        elif isinstance(spec, dict):
+            model = spec.get("model")
+            when = spec.get("when", "always")
+        else:
+            die(f"invalid reviewer config for {name!r}: {spec!r}")
+        if not model:
+            die(f"reviewer {name!r} is missing 'model'")
+        if when == "always":
+            selected[name] = model
+        elif when.startswith("surface:"):
+            req = when.split(":", 1)[1].strip()
+            if req in surface_set:
+                selected[name] = model
+            else:
+                skipped.append(f"{name} (no {req} surface)")
+        else:
+            die(f"unsupported reviewer condition {when!r} for {name!r}")
+    if not selected:
+        die("no reviewers selected; check factory/config.json `reviewers`")
+    return selected, skipped
+
+
 def main(argv):
     if len(argv) != 1:
         die("usage: route <job-id>")
@@ -32,7 +65,7 @@ def main(argv):
     job = json.loads((FACTORY / "jobs" / job_id / "job.json").read_text())
     if not job["intake"]:
         die(f"{job_id} has no intake.md")
-    reviewers = dict(CONFIG["reviewers"])
+    reviewers, skipped = select_reviewers(CONFIG["reviewers"], job["intake"].get("surfaces", []))
     agents = {
         "reviewers": reviewers,
         "reviewer_effort": CONFIG.get("reviewer_effort", "high"),
@@ -41,7 +74,10 @@ def main(argv):
     if res.returncode != 0:
         die(res.stderr.strip())
     effort = agents["reviewer_effort"]
-    print(f"{job_id}: reviewers " + ", ".join(f"{k} {v}({effort})" for k, v in reviewers.items()))
+    msg = f"{job_id}: reviewers " + ", ".join(f"{k} {v}({effort})" for k, v in reviewers.items())
+    if skipped:
+        msg += " | skipped: " + ", ".join(skipped)
+    print(msg)
 
 
 if __name__ == "__main__":
