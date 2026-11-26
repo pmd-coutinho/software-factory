@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""Assign the mandatory reviewer set from config.json to an accepted job.
+
+Usage: route <job-id>
+
+All four reviewers (code, security, ux, ui) are mandatory and run on opus
+(effort: high). Records the agent set in job.json with `job agents`.
+"""
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+FACTORY = Path(__file__).resolve().parents[1]
+CONFIG = json.loads((FACTORY / "config.json").read_text())
+
+
+def die(msg):
+    print(f"route: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def main(argv):
+    if len(argv) != 1:
+        die("usage: route <job-id>")
+    job_id = argv[0]
+    job_bin = str(FACTORY / "bin" / "job")
+    res = subprocess.run([job_bin, "sync", job_id], capture_output=True, text=True)
+    if res.returncode != 0:
+        die(res.stderr.strip())
+    job = json.loads((FACTORY / "jobs" / job_id / "job.json").read_text())
+    if not job["intake"]:
+        die(f"{job_id} has no intake.md")
+    reviewers = dict(CONFIG["reviewers"])
+    agents = {
+        "reviewers": reviewers,
+        "reviewer_effort": CONFIG.get("reviewer_effort", "high"),
+    }
+    res = subprocess.run([job_bin, "agents", job_id, json.dumps(agents)], capture_output=True, text=True)
+    if res.returncode != 0:
+        die(res.stderr.strip())
+    effort = agents["reviewer_effort"]
+    print(f"{job_id}: reviewers " + ", ".join(f"{k} {v}({effort})" for k, v in reviewers.items()))
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
