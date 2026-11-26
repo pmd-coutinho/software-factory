@@ -76,7 +76,19 @@ rates risk (`low`, `medium`, `high`) and surfaces (`ui`, `security`).
 `factory/bin/route` reads `reviewers` from `config.json`: by default `code` and
 `security` run on every job (`"when": "always"`), while `ux` and `ui` run when
 the `ui` surface is present (`"when": "surface:ui"`). Changing any entry to
-`"always"` makes it unconditional without touching a prompt.
+`"always"` makes it unconditional without touching a prompt. After a round
+with CHANGES, a reviewer runs again only if it asked for changes itself or is
+configured `"rerun": "always"` (the default for `code` and `security`; `ux`
+and `ui`, which drive a browser, are `"on-changes"`), so a one-line UX fix
+doesn't buy four more Opus reviews. Human feedback reruns every reviewer. The
+reviewers that ran in each round are in `round_reviewers` in `job.json`.
+
+**One preview server for the browser reviewers.** Two dev servers in one
+worktree fight over build caches and lock files. With `dev_server` set in
+`config.json`, `job serve` starts a single server on the job's port for `ux`
+and `ui` to share; without it, the orchestrator runs `ui` after `ux`.
+`job cleanup-ports` stops only processes whose working directory is in the
+job's worktree, and finds them with `lsof`, `ss` or `fuser`, whichever exists.
 
 **Scripts decide whether it works.** `factory/bin/gate` runs the main checkout's
 `checks.sh` inside the job's worktree with a configurable timeout
@@ -101,13 +113,23 @@ the job runs another round. Use `job cancel`, `job reject`, `job retry`, and
 
 **State is files, so runs resume.** Every fact the orchestrator needs is in
 `factory/jobs/` (`job.json`, `events.jsonl`, and stage artifacts). A global lock
-serializes job creation and concurrency slots, and `pending_jira_comment` tracks
-unposted Jira comments so crashes don't leave tickets silently parked.
+covers job creation and every transition that takes a concurrency slot, from
+the check through the save, and `pending_jira_comment` tracks unposted Jira
+comments so crashes don't leave tickets silently parked.
+
+**Transitions are safe to retry.** `advance` posts comments, changes labels and
+marks PRs ready before it saves `job.json`, so a failure part-way leaves the
+job in its old stage. Each remote effect is recorded in `.effects.json` under
+the transition's sequence number and skipped on retry; local steps (the
+worktree, renaming `intake.md`) check whether they already happened. Retrying
+never posts a comment twice or wedges on a half-made worktree. Job numbers
+count archived jobs too, so a retried ticket never reuses its old id.
 
 **Cost and observability per job.** `factory/bin/job` parses Claude Code
 subagent transcripts (cached in `factory/jobs/.cost-cache.json` by mtime/size),
 prefix-matches models against `prices_usd_per_mtok` (warning rather than
-crashing on unknown models), and records `cost_usd`, `cost_breakdown` (per-model
+crashing on unknown models; a model's optional `over_100k` rates price messages
+whose prompt exceeds 100K tokens), and records `cost_usd`, `cost_breakdown` (per-model
 and token counts), `progress` (active chunk/fix), `updated_at` (for stale-job
 detection on the dashboard), and an append-only `events.jsonl` timeline.
 
@@ -116,17 +138,24 @@ detection on the dashboard), and an append-only `events.jsonl` timeline.
 - In `jira` mode, only explicitly named tickets/epics run. In `github` mode,
   only issues labeled `factory` run (labels need triage or write access).
 - Ticket/issue text reaches agents as quoted data in `issue.md`, never pasted
-  into a prompt. Intake has no shell.
-- `protected_paths` blocks branches from touching factory scripts, config,
-  checks, patterns, or agent/skill definitions.
+  into a prompt, and only from trusted commenters (GitHub: the author and the
+  operator; Jira: the reporter, the operator and `jira_trusted_commenters`).
+  Intake has no shell.
+- `protected_paths` fails branches that touch factory scripts, config, checks,
+  patterns, agent/skill definitions, Claude settings, `.mcp.json`, CODEOWNERS
+  or CI workflows. A workflow added on a factory branch would otherwise run
+  with the repo's secrets as soon as the branch is pushed.
+- If the PR head moves past the commit the gate passed, the summary posted on
+  the PR warns that those commits weren't checked or reviewed.
 - `build.md` `ROUND`/`COMMIT` headers prevent stale artifacts from advancing
   across rounds; `decision.md` is archived on feedback.
-- Agents push only `factory/*` branches. The factory never auto-merges and never
-  deploys.
+- Agents are told to push only their `factory/*` branch (a prompt rule, not
+  enforced by a script). The factory never auto-merges and never deploys.
 - One PR per ticket/issue; at most `max_rounds` build rounds per job before a
   human is asked.
-- `job cleanup-ports` deterministically reaps dev servers and browser sessions
-  on a job's assigned ports after builder/UX/UI runs.
+- `job cleanup-ports` reaps dev servers and browser sessions on a job's
+  assigned ports after builder/UX/UI runs, leaving alone any process that
+  isn't running from the job's worktree.
 
 ## What changed from v1
 
@@ -135,8 +164,8 @@ detection on the dashboard), and an append-only `events.jsonl` timeline.
 | `/factory <feature>`, one job per session | `/factory run` drains the issue queue, `concurrency` jobs at once, one orchestrator | Alex; @spec2k5, @MrHossamsaraya |
 | Copy-paste build prompt | One install prompt pointing at this folder | @felipeclavijo1736 |
 | Every job gets all four reviewers | Fable intake rates risk and surfaces; a script routes reviewers and models | @mptrista, @Robin-ox2mz |
-| Every verdict is an LLM opinion | `checks.sh` gates before review and before merge | @Robin-ox2mz |
-| Local `git merge`, needs a clean main checkout | A PR per issue, merged with `gh pr merge` | v1 on-camera merge failures |
+| Every verdict is an LLM opinion | `checks.sh` gates every round before review | @Robin-ox2mz |
+| Local `git merge`, needs a clean main checkout | A PR per issue, merged by a human on GitHub | v1 on-camera merge failures |
 | `/factory approve` | Merge the PR on GitHub | v1 |
 | The spec writer can stall on questions | Intake asks on the issue and parks the job | @acidrazor |
 | Cost invisible | Cost and time per job on the dashboard and in the run summary | the most common comment |

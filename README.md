@@ -46,8 +46,8 @@ builder (haiku)         → runs each chunk sequentially on the same worktree;
         ▼                 ▲
 gate (script) ──FAIL──────┤  clean-tree + protected-paths + timed factory/checks.sh
         ▼ PASS            │
-reviewers (opus high)     │  routed reviewers in parallel
-        │   └─CHANGES─────┘  deduplicated Haiku review-fixer subagents fix findings point by point
+reviewers (opus high)     │  routed reviewers in parallel (later rounds: those that asked
+        │   └─CHANGES─────┘  for changes + code/security); Haiku review-fixers fix findings point by point
         ▼ all PASS
 approver (opus high)    → writes human-review summary on PR → marks PR ready (NO auto-merge)
 ```
@@ -112,8 +112,11 @@ DESIGN.md                     how it works and why
 ## Dashboard
 
 ```bash
-cd factory && python3 -m http.server
+cd factory && python3 -m http.server --bind 127.0.0.1
 ```
+
+Keep `--bind 127.0.0.1`: without it the server listens on every interface and
+anyone on your network can read ticket text, specs and check logs.
 
 Open <http://localhost:8000/dashboard.html>. Each job is a card with its
 ticket/issue and PR, active chunk/fix progress, a row of gate and review chips
@@ -135,10 +138,17 @@ where the spend goes, not what you're billed.
 - In `jira` mode, only explicitly named tickets/epics run. In `github` mode,
   only issues labeled `factory` run (labels need triage or write access). Ticket
   text reaches agents as quoted data in `issue.md`, never as their instructions.
-- `protected_paths` blocks branches from modifying factory scripts, checks,
-  config, patterns, or agent/skill definitions.
-- The factory pushes only `factory/*` branches, never auto-merges, and never
-  deploys.
+- `protected_paths` fails any branch that adds, changes or deletes factory
+  scripts, checks, config, patterns, agent/skill definitions, Claude settings,
+  `.mcp.json`, CODEOWNERS or CI workflows. Workflows matter most: a factory
+  branch lives in your repo, so a workflow it adds would run with the repo's
+  secrets before anyone reviews the PR.
+- In `jira` mode, only comments by the reporter, the operator and
+  `jira_trusted_commenters` reach the agents (in `github` mode, the issue
+  author's and the operator's).
+- Agents are told to push only their `factory/*` branch. The factory never
+  auto-merges and never deploys. If the PR head moves after the gate passed,
+  the review summary on the PR says those commits weren't checked.
 
 ## License
 

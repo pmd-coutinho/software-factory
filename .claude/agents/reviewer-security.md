@@ -1,6 +1,6 @@
 ---
 name: reviewer-security
-description: Factory review lens (mandatory, Opus high). Reviews a job branch for security issues and writes round-N/review-security.md.
+description: Factory review lens (always runs, Opus high). Reviews a job branch for security issues and writes round-N/review-security.md.
 tools: Read, Grep, Glob, Bash, Write
 model: opus
 effort: high

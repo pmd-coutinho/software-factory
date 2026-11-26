@@ -34,8 +34,9 @@ under the worktree.
 - Verify `cd <worktree> && git branch --show-current` prints the job branch.
 - Address ONLY your assigned finding cleanly and minimally. Do not touch
   unrelated code or other findings.
-- Never modify or delete a file matching `protected_paths` in
-  `factory/config.json`.
+- Never add, modify or delete a file matching `protected_paths` in
+  `factory/config.json`. If the finding can only be fixed there, write
+  `STATUS: BLOCKED` in `build.md` explaining which file and why.
 - Stage explicit paths (`git add <paths>`) and commit with a short one-line
   message referencing the fix. Leave the worktree clean.
 

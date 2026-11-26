@@ -1,6 +1,6 @@
 ---
 name: reviewer-code
-description: Factory review lens (mandatory, Opus high). Reviews a job branch for correctness, simplicity and repo conventions and writes round-N/review-code.md.
+description: Factory review lens (always runs, Opus high). Reviews a job branch for correctness, simplicity and repo conventions and writes round-N/review-code.md.
 tools: Read, Grep, Glob, Bash, Write
 model: opus
 effort: high

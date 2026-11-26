@@ -6,8 +6,8 @@ model: haiku
 ---
 
 You execute one build step for a factory job on Haiku. Your prompt gives the
-job id, the job folder, the worktree, the branch, the base, the Jira ticket
-key, the round, a port, and your exact assignment:
+job id, the job folder, the worktree, the branch, the base, the ticket or
+issue ref, the round, a port, and your exact assignment:
 
 - **Chunk mode** (`Chunk <k> of <M>: <title>`): implement ONLY Chunk `<k>` from
   `<job folder>/spec.md`.
@@ -38,8 +38,9 @@ there.
 3. `<job folder>/build.md` (if it exists) and `cd <worktree> && git log --oneline <base>..HEAD`
    to see what previous chunks already built.
 4. In Gate-fix mode: `round-<N-1>/checks.md` and `round-<N-1>/checks.log`.
-5. In Feedback mode: the named `feedback-*.md`, `decision.md`, and recent
-   round files. Human feedback overrides earlier reviews and spec where they
+5. In Feedback mode: the named `feedback-*.md`, the newest `decision-*.md`
+   (the summary the human was reacting to; `job feedback` archives
+   `decision.md` under that name), and recent round files. Human feedback overrides earlier reviews and spec where they
    disagree.
 
 ## Build
@@ -54,8 +55,9 @@ there.
 - Match the surrounding code: its idioms, formatting, naming and imports.
 - Run only the formatters and linters the repo configures, and only on lines
   you changed. Never reformat a whole file or run repo-wide `--fix`.
-- Never modify or delete an existing file that matches `protected_paths` in
-  `factory/config.json`; the gate fails the branch if you do. If you cannot
+- Never add, modify or delete a file that matches `protected_paths` in
+  `factory/config.json` (factory files, agent definitions, CI workflows,
+  Claude settings); the gate fails the branch if you do. If you cannot
   proceed without changing a protected file, write `STATUS: BLOCKED` in
   `build.md` explaining which file and why.
 
@@ -71,7 +73,9 @@ there.
   3. For criteria visible on a page, start the dev server from `AGENTS.md` in
      the worktree on your port, inspect with `agent-browser --session <job-id>-builder`,
      then close it (`agent-browser --session <job-id>-builder close`) and stop
-     only the server on your port (`lsof -tiTCP:<port> -sTCP:LISTEN`).
+     the server on your port with
+     `<main checkout>/factory/bin/job cleanup-ports <job-id> <port>` (it
+     leaves other jobs' servers alone; never kill by process name).
 
 ## Commit, push, PR
 

@@ -27,6 +27,9 @@ Then stop and tell the user if any of these fail:
 - `claude --version` is 2.1.257 or later (the intake agent runs on Fable).
 - `python3 --version` is 3.10 or later. The scripts use only the standard
   library.
+- One of `lsof`, `ss` or `fuser` is installed (`job cleanup-ports` uses it to
+  find dev servers on a job's ports). If none is, warn the user that leftover
+  dev servers won't be stopped automatically.
 - If the project has a web UI: check whether `agent-browser` is installed
   (`command -v agent-browser`). If missing, warn the user that UI/UX browser
   checks will be skipped until `agent-browser` is installed.
@@ -112,10 +115,16 @@ How to audit:
 - `tracker`: set to `"jira"` or `"github"` based on step 0.
 - `base_branch`: the default branch.
 - `labels`: used when `tracker` is `"github"` (ignored for `"jira"`).
-- `protected_paths`: keep all six factory entries (`factory/checks.sh`,
-  `factory/config.json`, `factory/bin/*`, `factory/patterns.md`,
-  `.claude/agents/*`, `.claude/skills/factory/*`) and don't add the project's
-  tests. Features legitimately change existing tests (a new required field
+- `protected_paths`: keep every default entry: the factory's own files
+  (`factory/checks.sh`, `factory/config.json`, `factory/bin/*`,
+  `factory/patterns.md`, `.claude/agents/*`, `.claude/skills/factory/*`) and
+  the paths that change what runs with privileges (`.claude/settings*.json`,
+  `.mcp.json`, `.github/workflows/*`, `.github/actions/*`, `CODEOWNERS`,
+  `.github/CODEOWNERS`). Factory branches are pushed to this repo, so a
+  workflow added on one runs with the repo's secrets before anyone reviews
+  it. If the project's CI lives elsewhere (`.gitlab-ci.yml`, `.circleci/*`,
+  `azure-pipelines.yml`, `Jenkinsfile`, `.buildkite/*`), add that path too.
+  Don't add the project's tests. Features legitimately change existing tests (a new required field
   changes every fixture), and a protected test blocks the job with no way
   through. The code reviewer catches weakened or special-cased tests instead.
   Add a path only when no job should ever change it. They are fnmatch
@@ -124,7 +133,17 @@ How to audit:
   check suite legitimately takes longer.
 - `reviewers`: `code` and `security` are `"when": "always"`; `ux` and `ui` are
   `"when": "surface:ui"` (change to `"always"` if you want all four on every job).
+  `"rerun": "on-changes"` (the default for `ux` and `ui`) means a reviewer
+  runs again after a CHANGES round only if it asked for changes itself.
 - `ports`: move `base` if the project already uses ports 5100–5199.
+- `dev_server`: if the project has a web UI, the command that starts its dev
+  server, with `{port}` where the port goes (`$PORT` is also set), e.g.
+  `"npm run dev -- --port {port}"`. The ux and ui reviewers then share one
+  server started by `factory/bin/job serve`. Leave it `""` if there's no UI;
+  the reviewers then take turns starting their own.
+- `jira_trusted_commenters` (`jira` only): display names, besides the reporter
+  and the operator, whose Jira comments intake should see (a PM or tech lead
+  who answers questions). Everyone else's comments are left out of `issue.md`.
 - Leave `concurrency`, `max_rounds`, `stale_minutes`, `reviewer_effort` and
   `prices_usd_per_mtok` as they are unless the user asks.
 
@@ -153,13 +172,15 @@ Then add a short section:
 ```markdown
 ## Software factory
 
-`/factory run <EPIC-KEY | KEY-1 KEY-2 ...>` builds Jira tickets (via the
-Atlassian/Jira MCP connector) through intake → spec (Opus high, chunked) →
-build (sequential Haiku chunks) → gate → 4× Opus (high) reviews (with Haiku
-point-by-point fixes) → PR human-review summary, one PR per ticket (never
-auto-merged). State is in `factory/jobs/` (gitignored); `factory/bin/job` is
-its only writer. Checks: `factory/checks.sh`. Dashboard:
-`cd factory && python3 -m http.server`, then open http://localhost:8000/dashboard.html.
+`/factory run <EPIC-KEY | KEY-1 KEY-2 ...>` (Jira) or `/factory run [<n> ...]`
+(GitHub issues labeled `factory`) builds tickets through intake → spec (Opus
+high, chunked) → build (sequential Haiku chunks) → gate → Opus (high) reviews
+(code + security, plus ux + ui on UI changes; Haiku point-by-point fixes) →
+PR human-review summary, one PR per ticket (never auto-merged). State is in
+`factory/jobs/` (gitignored); `factory/bin/job` is its only writer. Checks:
+`factory/checks.sh`. Dashboard:
+`cd factory && python3 -m http.server --bind 127.0.0.1`, then open
+http://localhost:8000/dashboard.html.
 
 Each job works in its own git worktree, a full checkout of the repo at
 `.worktrees/<job-id>` (gitignored). A tool run from the repo root that doesn't
