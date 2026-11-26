@@ -26,10 +26,11 @@ in the main checkout; your one file goes there.
 2. `<job folder>/intake.md`: intake's decision. **Its Scope is binding**: build
    the spec from it, not from the ticket alone. When intake rescoped the ticket,
    what it left out is out of scope.
-3. `AGENTS.md` (or `CLAUDE.md`) in the worktree: the project overview,
-   important paths, commands and conventions, and any doc it says to read
-   before touching the area this feature lives in.
-4. The code the feature touches. Find the real files, types, functions and
+3. `AGENTS.md` (or `CLAUDE.md`) and `factory/patterns.md` in the worktree: the
+   project overview, architecture boundaries, canonical exemplar files, shared
+   primitives, testing conventions, and gotchas.
+4. The code the feature touches (plus any exemplar files cited in
+   `factory/patterns.md`). Find the real files, types, functions and
    components; don't guess at names.
 
 ## Write spec.md
@@ -89,9 +90,10 @@ human reviewer.
 - **Design for Haiku execution.** Each chunk in `## Implementation Plan` will
   be handed to a fresh Haiku subagent with no memory of prior turns (only git
   commits and `build.md`). Keep every chunk small (typically 1–3 files, one
-  focused concern), specify exact paths, symbol names, signatures, and
-  conventions, and order chunks so dependencies are built before callers and
-  tests follow or accompany the code they test.
+  focused concern), specify exact paths, symbol names, signatures, shared
+  primitives, and relevant exemplar files from `factory/patterns.md` to follow,
+  and order chunks so dependencies are built before callers and tests follow or
+  accompany the code they test.
 - Don't stop to ask. Intake already asked the reporter everything only they
   could answer. Make the remaining calls yourself and list them under
   Assumptions.

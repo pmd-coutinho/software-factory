@@ -15,13 +15,13 @@ Open Claude Code in your project and paste:
 ```text
 Install this software factory in this project from the reference repository:
 
-https://github.com/zazencodes/zazencodes-season-3/tree/main/src/software-factory-claude-code-v2
+https://github.com/pmd-coutinho/software-factory
 ```
 
 Your agent reads [`INSTALL.md`](INSTALL.md), copies the skill, agents, scripts
 and dashboard, fills `factory/checks.sh` with your project's real test, lint,
-typecheck and build commands, tailors the reviewers to your stack, creates the
-GitHub labels, and checks that `checks.sh` passes on `main`.
+typecheck and build commands, audits your codebase into `factory/patterns.md`,
+tailors the reviewers to your stack, and checks that `checks.sh` passes on `main`.
 
 You need Claude Code 2.1.257 or later, `python3`, and an authenticated
 [`gh`](https://cli.github.com/) that can push to the repo.
@@ -104,6 +104,7 @@ you a copy when you [sign up to my newsletter](https://zazencodes.com/newsletter
 factory/
   config.json                 concurrency, rounds, mandatory reviewers, protected paths, prices
   checks.sh                   your repo's checks (the installer fills it in)
+  patterns.md                 curated codebase patterns, exemplars & primitives (installer audits & fills)
   bin/job                     the only writer of job.json; refuses illegal moves; marks PR ready
   bin/gate                    runs checks.sh in a job's worktree → round-N/checks.md
   bin/route                   assigns all 4 mandatory Opus (high) reviewers

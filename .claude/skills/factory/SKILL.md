@@ -54,6 +54,7 @@ through the scripts. `factory/jobs/` is gitignored runtime state.
 ```
 <repo>/factory/config.json                     concurrency, rounds, mandatory reviewers, prices
 <repo>/factory/checks.sh                       the repo's checks; the gate runs it
+<repo>/factory/patterns.md                     curated codebase patterns, exemplars, shared primitives
 <repo>/factory/bin/job                         the only writer of job.json
 <repo>/factory/bin/gate                        runs checks.sh in a worktree → round-N/checks.md
 <repo>/factory/bin/route                       records the 4 mandatory Opus (high) reviewers
@@ -300,6 +301,11 @@ mean, ask.
 
   Post the reason as a `[factory]` comment on the Jira ticket via the
   connector. The PR (if any) is closed by the script.
+- **Refreshing codebase patterns (`/factory refresh-patterns`)**: re-audit the
+  main checkout's codebase following the `factory/patterns.md` audit guidelines
+  in `INSTALL.md` (keep it under ~150 lines, pointer-based with real exemplar
+  paths), update `factory/patterns.md`, and show the user the diff to review
+  and commit.
 - **An answer to a `needs-info` question**: post their answer on the Jira
   ticket via the connector, refresh `issue.md` with `factory/bin/job refresh <id>`,
   then `factory/bin/job advance <id> intake` and go to **intake**.

@@ -23,7 +23,7 @@ under the worktree.
 
 ## Read first
 
-1. `AGENTS.md` (or `CLAUDE.md`) in the worktree.
+1. `AGENTS.md` (or `CLAUDE.md`) and `factory/patterns.md` in the worktree.
 2. `<job folder>/spec.md` and `<job folder>/build.md`.
 3. `<job folder>/round-<prev>/review-<reviewer>.md` for full context on your
    assigned finding.

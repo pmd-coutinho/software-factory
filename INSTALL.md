@@ -4,8 +4,8 @@ You are a coding agent installing this factory into the user's project. Copy
 what's generic, adapt what's repo-specific, verify it, and report. Work in the
 project's root. Don't clone this repository.
 
-The source is the folder the user pointed you at. On GitHub, read files from
-`https://raw.githubusercontent.com/zazencodes/zazencodes-season-3/main/src/software-factory-claude-code-v2/<path>`.
+The source is the repository the user pointed you at. On GitHub, read files from
+`https://raw.githubusercontent.com/pmd-coutinho/software-factory/main/<path>`.
 
 ## 0. Check the project
 
@@ -40,6 +40,7 @@ Copy these files to the same paths in the project, unchanged:
 .claude/agents/approver.md
 factory/config.json
 factory/checks.sh
+factory/patterns.md
 factory/bin/job
 factory/bin/gate
 factory/bin/route
@@ -47,7 +48,7 @@ factory/dashboard.html
 ```
 
 ```bash
-SRC=https://raw.githubusercontent.com/zazencodes/zazencodes-season-3/main/src/software-factory-claude-code-v2
+SRC=https://raw.githubusercontent.com/pmd-coutinho/software-factory/main
 for f in <the paths above>; do
   mkdir -p "$(dirname "$f")" && curl -fsSL "$SRC/$f" -o "$f"
 done
@@ -67,6 +68,34 @@ and CI config. The script runs with a job's worktree as its working directory.
 It must be non-interactive, must not rewrite files (no `--fix`, no
 `--update-snapshots`), and must exit non-zero on any failure. Keep
 `set -euo pipefail`.
+
+**`factory/patterns.md` (Codebase audit).** Inspect the codebase thoroughly and
+replace the `TODO` placeholders in `factory/patterns.md` with a concise,
+high-leverage reference that `spec-writer` (Opus high), `builder` (Haiku),
+`review-fixer` (Haiku), and `reviewer-code` read on every job.
+
+How to audit:
+- Survey the directory structure, package manifests, entry points, routing/API
+  layer, data/DB layer, auth/permissions, UI/styling system, shared utilities,
+  and test suites.
+- Identify 1–2 **real, clean exemplar files** per major feature type (e.g., an
+  API route/handler, a UI component/page, a service/data module, a test file).
+  Avoid legacy or half-migrated files; check recent git history if unsure.
+- Keep `factory/patterns.md` **under ~150 lines**. Prefer exact file paths and
+  symbol names ("mirror `src/features/billing/api.ts`", "use `apiClient` from
+  `src/lib/http.ts`") over long prose explanations, so it stays accurate and
+  doesn't bloat agent context.
+- Fill all five sections:
+  1. **Architecture & Boundaries** — where new code belongs and forbidden
+     imports / layer violations.
+  2. **Canonical Exemplars** — real file paths to copy when adding each kind of
+     code.
+  3. **Shared Primitives** — auth, API/DB clients, error wrappers, state/query
+     hooks, design tokens / shared UI components.
+  4. **Testing & Fixtures** — test file placement, factories/fixtures, mocking
+     conventions.
+  5. **Gotchas & Anti-patterns** — traps linters don't catch and deprecated
+     patterns not to imitate.
 
 **`factory/config.json`.**
 
@@ -144,7 +173,9 @@ committed, so ignore only these two paths, never `.claude/` or `factory/`.
    `description`, `tools`, `model`, and optional `effort`. Claude Code ignores
    unknown keys without a warning, so a typo silently changes behaviour.
 4. `python3 -m json.tool factory/config.json` succeeds.
-5. `git check-ignore factory/jobs/x .worktrees/x` prints both paths, and
+5. `factory/patterns.md` has no `TODO` placeholders left, cites real paths that
+   exist in the repo, and stays concise (~150 lines or fewer).
+6. `git check-ignore factory/jobs/x .worktrees/x` prints both paths, and
    `git status --porcelain --untracked-files=all` lists every file from step 1
    (the skill, the agents and `factory/`) as committable.
 

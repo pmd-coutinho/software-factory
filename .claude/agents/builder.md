@@ -29,8 +29,9 @@ there.
 
 ## Read first
 
-1. `AGENTS.md` (or `CLAUDE.md`) in the worktree: the canonical repo
-   instructions. Follow them.
+1. `AGENTS.md` (or `CLAUDE.md`) and `factory/patterns.md` in the worktree: the
+   canonical repo instructions, exemplars, shared primitives, and gotchas.
+   Follow them.
 2. `<job folder>/spec.md`: the full spec and `## Implementation Plan`. Follow
    your assigned chunk precisely. `issue.md` and `intake.md` are background;
    the spec is what you build.
