@@ -344,14 +344,20 @@ function verdictOf(line) {
   return m ? m[1] : 'invalid'
 }
 
-// A round's verdicts come from its files: the gate first, then each routed reviewer.
+// The reviewers that ran in round n. After a CHANGES round, reviewers routed with
+// `"rerun": "on-changes"` only run again if they asked for changes themselves.
+function roundReviewers(job, n) {
+  return job.round_reviewers?.[String(n)] ?? Object.keys(job.agents?.reviewers || {})
+}
+
+// A round's verdicts come from its files: the gate first, then each reviewer that ran.
 async function roundVerdicts(job, n) {
   const key = `${job.id}/${n}`
   if (roundCache.has(key)) return roundCache.get(key)
   const dir = `jobs/${job.id}/round-${n}/`
   const v = { gate: verdictOf(await fetchFirst(dir + 'checks.md')), reviews: {} }
   if (v.gate === 'PASS') {
-    await Promise.all(Object.keys(job.agents?.reviewers || {}).map(async (r) => {
+    await Promise.all(roundReviewers(job, n).map(async (r) => {
       v.reviews[r] = verdictOf(await fetchFirst(`${dir}review-${r}.md`))
     }))
   }
@@ -369,7 +375,7 @@ function roundRow(job, n, v) {
   const current = n === job.round
   const cells = [chip('gate', v.gate, current && job.stage === 'gate', 'gate', 'gate')]
   if (v.gate === 'PASS') {
-    for (const r of Object.keys(job.agents?.reviewers || {})) {
+    for (const r of roundReviewers(job, n)) {
       cells.push(chip(SHORT[r] || r, v.reviews[r], current && job.stage === 'review', r))
     }
   }

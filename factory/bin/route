@@ -5,7 +5,12 @@ Usage: route <job-id>
 
 Each entry in config.json `reviewers` is either:
   - a string model name (e.g. "opus"), treated as always-on, or
-  - {"model": "opus", "when": "always" | "surface:<name>"}
+  - {"model": "opus", "when": "always" | "surface:<name>", "rerun": "always" | "on-changes"}
+
+`rerun` says what happens after a round in which some reviewer asked for
+CHANGES: "always" (the default) reviews every round again; "on-changes" reviews
+again only if this reviewer itself asked for changes. Human feedback always
+reruns every routed reviewer.
 
 Records the selected agent set in job.json with `job agents`.
 """
@@ -25,20 +30,24 @@ def die(msg):
 
 
 def select_reviewers(config_reviewers, surfaces):
-    """Return (selected_dict, skipped_list) based on config rules and intake surfaces."""
+    """Return (selected_dict, skipped_list, rerun_always_list) from config rules and intake surfaces."""
     selected = {}
     skipped = []
+    rerun_always = []
     surface_set = set(surfaces or [])
     for name, spec in config_reviewers.items():
         if isinstance(spec, str):
-            model, when = spec, "always"
+            model, when, rerun = spec, "always", "always"
         elif isinstance(spec, dict):
             model = spec.get("model")
             when = spec.get("when", "always")
+            rerun = spec.get("rerun", "always")
         else:
             die(f"invalid reviewer config for {name!r}: {spec!r}")
         if not model:
             die(f"reviewer {name!r} is missing 'model'")
+        if rerun not in {"always", "on-changes"}:
+            die(f"unsupported rerun {rerun!r} for {name!r} (expected 'always' or 'on-changes')")
         if when == "always":
             selected[name] = model
         elif when.startswith("surface:"):
@@ -51,7 +60,11 @@ def select_reviewers(config_reviewers, surfaces):
             die(f"unsupported reviewer condition {when!r} for {name!r}")
     if not selected:
         die("no reviewers selected; check factory/config.json `reviewers`")
-    return selected, skipped
+    for name in selected:
+        spec = config_reviewers[name]
+        if isinstance(spec, str) or spec.get("rerun", "always") == "always":
+            rerun_always.append(name)
+    return selected, skipped, rerun_always
 
 
 def main(argv):
@@ -65,9 +78,10 @@ def main(argv):
     job = json.loads((FACTORY / "jobs" / job_id / "job.json").read_text())
     if not job["intake"]:
         die(f"{job_id} has no intake.md")
-    reviewers, skipped = select_reviewers(CONFIG["reviewers"], job["intake"].get("surfaces", []))
+    reviewers, skipped, rerun_always = select_reviewers(CONFIG["reviewers"], job["intake"].get("surfaces", []))
     agents = {
         "reviewers": reviewers,
+        "rerun_always": rerun_always,
         "reviewer_effort": CONFIG.get("reviewer_effort", "high"),
     }
     res = subprocess.run([job_bin, "agents", job_id, json.dumps(agents)], capture_output=True, text=True)
@@ -77,6 +91,9 @@ def main(argv):
     msg = f"{job_id}: reviewers " + ", ".join(f"{k} {v}({effort})" for k, v in reviewers.items())
     if skipped:
         msg += " | skipped: " + ", ".join(skipped)
+    on_changes = [r for r in reviewers if r not in rerun_always]
+    if on_changes:
+        msg += " | rerun only on own changes: " + ", ".join(on_changes)
     print(msg)
 
 
