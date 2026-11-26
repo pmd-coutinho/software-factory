@@ -1,12 +1,13 @@
 # Software Factory for Claude Code (v2)
 
-A software factory that works through your Jira tickets (via Claude's
-Atlassian/Jira MCP connector). Pass a Jira epic or space-separated ticket keys
-to `/factory run`, and agents decide whether each ticket is worth building,
-write a chunked spec on Opus (high), execute each chunk sequentially on Haiku,
-test it with your own checks, run all four mandatory Opus (high) reviewers,
-fix review findings point by point on Haiku, write a human-review summary on
-the PR, and mark the PR ready for review (never auto-merging).
+A software factory that works through **Jira tickets** (via Claude's
+Atlassian/Jira MCP connector) or **GitHub Issues** — chosen at install time in
+`factory/config.json` (`"tracker": "jira" | "github"`). Agents decide whether
+each ticket/issue is worth building, write a chunked spec on Opus (high),
+execute each chunk sequentially on Haiku, test it with your own checks, run
+all four mandatory Opus (high) reviewers, fix review findings point by point
+on Haiku, write a human-review summary on the PR, and mark the PR ready for
+review (never auto-merging).
 
 ## Install
 
@@ -57,16 +58,26 @@ every job back up.
 
 ## Commands
 
+**Jira mode** (`"tracker": "jira"` — no bare `/factory run`):
 ```
 /factory run <EPIC-KEY>            expand the epic's open child tickets and run them
 /factory run <KEY-1> <KEY-2> ...   run specific Jira tickets (space-separated)
-/factory <anything>                talk to the factory: ask about jobs, give feedback, reject
 ```
 
-There is no bare `/factory run` without arguments. You approve by merging the
-PR on GitHub—the factory never auto-merges. To change a PR, tell the factory
-what you want with `/factory`. To drop a job that waits on you or on its
-reporter, tell the factory to reject it.
+**GitHub Issues mode** (`"tracker": "github"`):
+```
+/factory run                       drain the queue: every open `factory`-labeled issue
+/factory run <n> [<m> ...]         run specific GitHub issue(s) now
+```
+
+**Both modes:**
+```
+/factory <anything>                ask about jobs, give feedback, reject, or refresh-patterns
+```
+
+You approve by merging the PR on GitHub—the factory never auto-merges. To
+change a PR, tell the factory what you want with `/factory`. To drop a job
+that waits on you or on its reporter, tell the factory to reject it.
 
 ## The guide
 

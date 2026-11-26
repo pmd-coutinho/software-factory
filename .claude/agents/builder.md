@@ -85,7 +85,10 @@ there.
     job branch.
   - If the branch has no PR yet (`cd <worktree> && gh pr view <branch>` fails),
     open it as a draft:
-    `cd <worktree> && gh pr create --draft --base <base> --head <branch> --title "<KEY>: <spec title>" --body "Jira: <KEY>"`
+    - When `Tracker: github`:
+      `cd <worktree> && gh pr create --draft --base <base> --head <branch> --title "<spec title>" --body "Closes #<Ref>"`
+    - When `Tracker: jira`:
+      `cd <worktree> && gh pr create --draft --base <base> --head <branch> --title "<Ref>: <spec title>" --body "Jira: <Ref>"`
     followed by a blank line and your Summary. Once it exists, just push; the
     PR updates itself. Never mark the PR ready and never merge it.
 

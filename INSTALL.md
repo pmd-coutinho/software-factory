@@ -7,16 +7,23 @@ project's root. Don't clone this repository.
 The source is the repository the user pointed you at. On GitHub, read files from
 `https://raw.githubusercontent.com/pmd-coutinho/software-factory/main/<path>`.
 
-## 0. Check the project
+## 0. Check the project & choose tracker
 
-Stop and tell the user if any of these fail:
+First, ask the user which issue tracker this project uses (if they didn't
+already specify it):
+
+- **`jira`** — Claude's Atlassian / Jira MCP connector; `/factory run <EPIC-KEY>` or `/factory run <KEY-1> <KEY-2> ...` (no bare `/factory run`).
+- **`github`** — GitHub Issues labeled `factory`; `/factory run` drains the queue, or `/factory run <n>`.
+
+Then stop and tell the user if any of these fail:
 
 - It's a git repo with an `origin` on GitHub, and `gh auth status` shows a user
-  who can push branches and open/update pull requests.
+  who can push branches and open/update pull requests (and manage labels when
+  using `github`).
 - Its default branch (`gh repo view --json defaultBranchRef`) exists on
   `origin`.
-- Claude's Atlassian / Jira MCP connector is configured and can read Jira
-  tickets/epics and post comments.
+- If `jira`: Claude's Atlassian / Jira MCP connector is configured and can read
+  Jira tickets/epics and post comments.
 - `claude --version` is 2.1.257 or later (the intake agent runs on Fable).
 - `python3 --version` is 3.10 or later. The scripts use only the standard
   library.
@@ -99,7 +106,9 @@ How to audit:
 
 **`factory/config.json`.**
 
+- `tracker`: set to `"jira"` or `"github"` based on step 0.
 - `base_branch`: the default branch.
+- `labels`: used when `tracker` is `"github"` (ignored for `"jira"`).
 - `protected_paths`: keep the two factory entries and don't add the project's
   tests. Features legitimately change existing tests (a new required field
   changes every fixture), and a protected test blocks the job with no way
@@ -162,13 +171,24 @@ copied in step 1 does: the skill in `.claude/skills/factory/`, the agents in
 `.claude/agents/` and the rest of `factory/` are part of the project and get
 committed, so ignore only these two paths, never `.claude/` or `factory/`.
 
+**Labels (only when `tracker` is `"github"`).** Create them on GitHub:
+
+```bash
+gh label create factory --color 5319E7 --description "Build this with the software factory"
+gh label create factory:needs-info --color FBCA04 --description "The factory asked the author a question"
+gh label create factory:needs-human --color D93F0B --description "The factory needs a human decision on the PR"
+```
+
+Skip this step when `tracker` is `"jira"`.
+
 ## 3. Verify
 
 1. In the project root, on the current branch, `bash factory/checks.sh` exits 0.
    If it fails there, the factory can never pass a job: fix the
    script (not the project) or tell the user what's broken.
-2. `factory/bin/job status` runs without an error (and bare `factory/bin/job queue`
-   exits non-zero reminding you to pass ticket keys).
+2. `factory/bin/job status` runs without an error (and if `tracker` is `"github"`,
+   `factory/bin/job queue` runs without an error; if `tracker` is `"jira"`,
+   bare `factory/bin/job queue` exits non-zero reminding you to pass ticket keys).
 3. Each file in `.claude/agents/` has only these frontmatter keys: `name`,
    `description`, `tools`, `model`, and optional `effort`. Claude Code ignores
    unknown keys without a warning, so a typo silently changes behaviour.
@@ -188,12 +208,14 @@ so the install must be on that branch there before the first run.
 
 Then tell the user, in a few lines:
 
-- Run `/factory run <EPIC-KEY>` or `/factory run <KEY-1> <KEY-2>` in Claude
-  Code from the project root (there is no bare `/factory run`).
+- If `jira`: run `/factory run <EPIC-KEY>` or `/factory run <KEY-1> <KEY-2>`
+  in Claude Code from the project root (there is no bare `/factory run`).
+- If `github`: label one or two small issues `factory`, then run `/factory run`
+  (or `/factory run <n>`) in Claude Code from the project root.
 - Every passing job ends as a PR with a human-review summary comment, marked
   ready for review — the factory never auto-merges. Merge it on GitHub to
   approve, or tell the factory what to change with `/factory <anything>`.
-- Intake runs on Fable, once per ticket. Depending on their plan, Fable can
-  bill to usage credits rather than the plan's included usage.
+- Intake runs on Fable, once per ticket/issue. Depending on their plan, Fable
+  can bill to usage credits rather than the plan's included usage.
 - To start carefully, set `concurrency` to 1 in `factory/config.json` and read
   every PR until they trust it.

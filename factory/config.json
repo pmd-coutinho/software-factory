@@ -1,7 +1,13 @@
 {
+  "tracker": "jira",
   "concurrency": 3,
   "max_rounds": 3,
   "base_branch": "main",
+  "labels": {
+    "queue": "factory",
+    "needs_info": "factory:needs-info",
+    "needs_human": "factory:needs-human"
+  },
   "reviewers": {
     "code": "opus",
     "security": "opus",
